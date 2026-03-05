@@ -1,0 +1,38 @@
+# Rust / Cargo
+target/
+**/target/
+
+# Tauri / desktop build outputs
+src-tauri/target/
+
+# Node / frontend tooling
+node_modules/
+**/node_modules/
+
+# Test artifacts
+playwright-report/
+test-results/
+logs/
+*.log
+
+# IDE / editor
+.vscode/
+.idea/
+.codex/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local runtime data
+*.db
+*.db-shm
+*.db-wal
+curriculo/

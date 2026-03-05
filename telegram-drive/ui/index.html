@@ -1,0 +1,92 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Telegram Drive</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="appRoot">
+    <section id="authScreen" class="auth-screen">
+      <div class="auth-bg-shape auth-bg-shape-1"></div>
+      <div class="auth-bg-shape auth-bg-shape-2"></div>
+      <div class="auth-card">
+        <h1>Telegram Drive</h1>
+        <p class="auth-subtitle">Login seguro para acessar seus arquivos.</p>
+
+        <div id="authMessage" class="auth-message hidden"></div>
+
+        <form id="authFormStart" class="auth-form">
+          <label>Telefone</label>
+          <input id="inputPhone" type="text" placeholder="+55..." />
+          <label>API ID</label>
+          <input id="inputApiId" type="number" placeholder="******" />
+          <label>API Hash</label>
+          <input id="inputApiHash" type="password" placeholder="********" />
+          <button id="btnAuthStart" type="submit">Enviar codigo</button>
+        </form>
+
+        <form id="authFormCode" class="auth-form hidden">
+          <label>Codigo recebido</label>
+          <input id="inputCode" type="text" placeholder="12345" />
+          <button id="btnAuthCode" type="submit">Validar codigo</button>
+        </form>
+
+        <form id="authFormPassword" class="auth-form hidden">
+          <label>Senha 2FA</label>
+          <input id="inputPassword" type="password" placeholder="Senha" />
+          <button id="btnAuthPassword" type="submit">Validar senha</button>
+        </form>
+      </div>
+    </section>
+
+    <div id="driveShell" class="hidden">
+      <header class="top-bar">
+        <button id="btnUpload">Upload</button>
+        <button id="btnUploadFolder">Upload Folder</button>
+        <button id="btnFolder">New Folder</button>
+        <input id="searchInput" type="search" placeholder="Search files or folders" />
+        <span class="spacer"></span>
+        <span id="authBadge" class="auth-badge">Logged in</span>
+      </header>
+      <div id="driveMessage" class="drive-message hidden"></div>
+
+      <div class="layout">
+        <aside class="sidebar">
+          <h3>Folders</h3>
+          <ul id="folderTree"></ul>
+        </aside>
+
+        <main class="main-panel" id="dropZone">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Size</th>
+                <th>Type</th>
+                <th>Upload Date</th>
+              </tr>
+            </thead>
+            <tbody id="fileRows"></tbody>
+          </table>
+        </main>
+      </div>
+
+      <section class="progress-panel">
+        <h3>Transfers</h3>
+        <div id="progressList"></div>
+      </section>
+    </div>
+
+    <div id="previewModal" class="hidden modal">
+      <div class="modal-card">
+        <button id="closePreview" class="close-btn">Close</button>
+        <img id="previewImage" alt="preview" />
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
