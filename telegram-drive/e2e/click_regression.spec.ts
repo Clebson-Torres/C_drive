@@ -22,12 +22,21 @@ test.beforeEach(async ({ page }) => {
           switch (cmd) {
             case "auth_status":
               return ok(authState);
+            case "auth_prefill":
+              return ok({ phone: "+551100000000", api_id: 37673970, api_hash: "hash" });
             case "auth_start":
               authState = "AwaitingCode";
               return ok(authState);
             case "auth_verify_code":
               authState = "LoggedIn";
               return ok(authState);
+            case "auth_profile":
+              return ok({
+                display_name: "Telegram User",
+                username: "telegram_user",
+                phone_masked: "***0000",
+                avatar_path_opt: null,
+              });
             case "folder_tree":
               return ok(folders);
             case "list_folder":
@@ -49,6 +58,8 @@ test.beforeEach(async ({ page }) => {
                 return err("missing required key directory_path");
               }
               return ok([10, 11]);
+            case "settings_get":
+              return ok({ chunk_size_bytes: 33554432, max_parallelism: 16, encrypt_chunks: true });
             default:
               return ok(null);
           }
@@ -79,4 +90,3 @@ test("click upload folder works even with snake_case backend expectation", async
   await page.click("#btnUploadFolder");
   await expect(page.locator("#driveMessage")).toContainText("Upload de pasta iniciado.");
 });
-

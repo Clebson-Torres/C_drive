@@ -17,6 +17,8 @@ test.beforeEach(async ({ page }) => {
           switch (cmd) {
             case "auth_status":
               return ok(authState);
+            case "auth_prefill":
+              return ok({ phone: "+551100000000", api_id: 37673970, api_hash: "hash" });
             case "auth_start":
               if (!args?.input?.phone || !args?.input?.api_id || !args?.input?.api_hash) {
                 return err("invalid auth input");
@@ -39,6 +41,16 @@ test.beforeEach(async ({ page }) => {
                 return ok(authState);
               }
               return err("invalid 2FA password");
+            case "auth_profile":
+              return ok({
+                display_name: "Telegram User",
+                username: "telegram_user",
+                phone_masked: "***0000",
+                avatar_path_opt: null,
+              });
+            case "auth_logout":
+              authState = "LoggedOut";
+              return ok(authState);
             case "folder_tree":
               return ok(folders);
             case "list_folder":
@@ -82,7 +94,9 @@ test.beforeEach(async ({ page }) => {
             case "preview_image":
               return ok({ local_path: "C:/tmp/preview.png", mime_type: "image/png" });
             case "transfer_cancel":
+              return ok(null);
             case "settings_get":
+              return ok({ chunk_size_bytes: 33554432, max_parallelism: 16, encrypt_chunks: true });
             case "settings_set":
               return ok(null);
             default:
@@ -112,6 +126,7 @@ async function login(page: any) {
 test("renders login screen and no QR button", async ({ page }) => {
   await expect(page.locator("#authScreen")).toBeVisible();
   await expect(page.locator("#btnQr")).toHaveCount(0);
+  await expect(page.locator("#btnApiHelp")).toBeVisible();
 });
 
 test("full login with code unlocks drive", async ({ page }) => {
@@ -144,8 +159,9 @@ test("2fa path requires password", async ({ page }) => {
 
 test("create folder sends native tauri payload and shows success message", async ({ page }) => {
   await login(page);
-  page.once("dialog", (dialog) => dialog.accept("Projetos"));
   await page.click("#btnFolder");
+  await page.fill("#newFolderInput", "Projetos");
+  await page.click("#btnNewFolderConfirm");
 
   await expect(page.locator("#driveMessage")).toContainText('Pasta "Projetos" criada.');
 
@@ -184,4 +200,44 @@ test("upload folder uses native picker and calls upload_folder with directoryPat
     directoryPath: "C:/tmp/folder-A",
     directory_path: "C:/tmp/folder-A",
   });
+});
+
+test("user menu exposes settings and logout", async ({ page }) => {
+  await login(page);
+  await page.click("#btnUserMenu");
+  await expect(page.locator("#userMenu")).toBeVisible();
+  await page.click("#btnOpenSettings");
+  await expect(page.locator("#settingsModal")).toBeVisible();
+  await page.click("#btnSettingsClose");
+  await page.click("#btnUserMenu");
+  await page.click("#btnLogout");
+  await expect(page.locator("#authScreen")).toBeVisible();
+});
+
+test("settings modal lets user choose chunk size profile", async ({ page }) => {
+  await login(page);
+  await page.click("#btnUserMenu");
+  await page.click("#btnOpenSettings");
+  await expect(page.locator("#settingsModal")).toBeVisible();
+  await page.selectOption("#settingsChunkSize", "67108864");
+  await expect(page.locator("#settingsChunkSummary")).toContainText("64 MiB");
+  await page.fill("#settingsParallelism", "24");
+  await page.click("#btnSettingsSave");
+
+  await expect(page.locator("#driveMessage")).toContainText("Settings salvos.");
+
+  const calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
+  const settingsCall = calls.find((c: any) => c.cmd === "settings_set");
+  expect(settingsCall).toBeTruthy();
+  expect(settingsCall.args.settings).toMatchObject({
+    chunk_size_bytes: 67108864,
+    max_parallelism: 24,
+    encrypt_chunks: true,
+  });
+});
+
+test("api help modal shows official link", async ({ page }) => {
+  await page.click("#btnApiHelp");
+  await expect(page.locator("#apiHelpModal")).toBeVisible();
+  await expect(page.locator("#apiHelpLink")).toHaveAttribute("href", "https://my.telegram.org/apps");
 });

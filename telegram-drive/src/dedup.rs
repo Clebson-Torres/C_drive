@@ -15,7 +15,11 @@ impl DedupEngine {
         self.db.find_file_by_hash(file_hash)
     }
 
-    pub fn find_duplicate_chunk(&self, chunk_hash: &str, chunk_size: i64) -> AppResult<Option<ChunkIndexRow>> {
+    pub fn find_duplicate_chunk(
+        &self,
+        chunk_hash: &str,
+        chunk_size: i64,
+    ) -> AppResult<Option<ChunkIndexRow>> {
         let row = self.db.get_chunk_index(chunk_hash)?;
         match row {
             Some(existing) if existing.size == chunk_size => Ok(Some(existing)),

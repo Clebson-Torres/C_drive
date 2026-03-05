@@ -1,5 +1,5 @@
-﻿<!doctype html>
-<html lang="en">
+<!doctype html>
+<html lang="pt-BR">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -7,86 +7,240 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <div id="appRoot">
+  <div id="appRoot" class="app-root">
     <section id="authScreen" class="auth-screen">
       <div class="auth-bg-shape auth-bg-shape-1"></div>
       <div class="auth-bg-shape auth-bg-shape-2"></div>
+      <div class="auth-bg-grid"></div>
       <div class="auth-card">
-        <h1>Telegram Drive</h1>
-        <p class="auth-subtitle">Login seguro para acessar seus arquivos.</p>
-
+        <span class="brand-pill">Telegram Drive</span>
+        <h1>Seu storage pessoal sobre o Telegram.</h1>
+        <p class="auth-subtitle">Sessão persistente, cache local e deduplicação global no mesmo fluxo.</p>
         <div id="authMessage" class="auth-message hidden"></div>
+        <button id="btnApiHelp" type="button" class="ghost-btn auth-help-btn">Como obter API ID / API Hash</button>
 
         <form id="authFormStart" class="auth-form">
-          <label>Telefone</label>
+          <label for="inputPhone">Telefone</label>
           <input id="inputPhone" type="text" placeholder="+55..." />
-          <label>API ID</label>
-          <input id="inputApiId" type="number" placeholder="******" />
-          <label>API Hash</label>
-          <input id="inputApiHash" type="password" placeholder="********" />
-          <button id="btnAuthStart" type="submit">Enviar codigo</button>
+          <label for="inputApiId">API ID</label>
+          <input id="inputApiId" type="number" placeholder="37673970" />
+          <label for="inputApiHash">API Hash</label>
+          <input id="inputApiHash" type="password" placeholder="6738..." />
+          <button id="btnAuthStart" type="submit">Enviar código</button>
         </form>
 
         <form id="authFormCode" class="auth-form hidden">
-          <label>Codigo recebido</label>
+          <label for="inputCode">Código recebido</label>
           <input id="inputCode" type="text" placeholder="12345" />
-          <button id="btnAuthCode" type="submit">Validar codigo</button>
+          <button id="btnAuthCode" type="submit">Validar código</button>
         </form>
 
         <form id="authFormPassword" class="auth-form hidden">
-          <label>Senha 2FA</label>
+          <label for="inputPassword">Senha 2FA</label>
           <input id="inputPassword" type="password" placeholder="Senha" />
           <button id="btnAuthPassword" type="submit">Validar senha</button>
         </form>
       </div>
     </section>
 
-    <div id="driveShell" class="hidden">
-      <header class="top-bar">
-        <button id="btnUpload">Upload</button>
-        <button id="btnUploadFolder">Upload Folder</button>
-        <button id="btnFolder">New Folder</button>
-        <input id="searchInput" type="search" placeholder="Search files or folders" />
-        <span class="spacer"></span>
-        <span id="authBadge" class="auth-badge">Logged in</span>
+    <div id="driveShell" class="drive-shell hidden">
+      <div class="drive-bg-shape drive-bg-shape-1"></div>
+      <div class="drive-bg-shape drive-bg-shape-2"></div>
+      <header class="shell-header glass-panel">
+        <div class="shell-brand">
+          <span class="brand-pill">Telegram Drive</span>
+          <div>
+            <h2>Workspace</h2>
+            <p id="currentFolderLabel">Selecione uma pasta para navegar e sincronizar.</p>
+          </div>
+        </div>
+        <div class="shell-actions">
+          <button id="btnUpload" class="primary-btn">Upload</button>
+          <button id="btnUploadFolder" class="secondary-btn">Upload Folder</button>
+          <button id="btnFolder" class="secondary-btn">New Folder</button>
+          <label class="search-shell">
+            <span>Search</span>
+            <input id="searchInput" type="search" placeholder="Search files or folders" />
+          </label>
+          <div class="user-menu-shell">
+            <button id="btnUserMenu" class="user-menu-trigger" type="button" aria-expanded="false">
+              <span id="userAvatar" class="user-avatar">T</span>
+              <span class="user-menu-meta">
+                <strong id="userDisplayName">Telegram</strong>
+                <span id="authBadge" class="auth-badge">Logged in</span>
+              </span>
+            </button>
+            <div id="userMenu" class="user-menu hidden">
+              <div class="user-menu-card">
+                <div class="user-menu-header">
+                  <span id="userAvatarLarge" class="user-avatar user-avatar-large">T</span>
+                  <div>
+                    <strong id="userMenuName">Telegram</strong>
+                    <p id="userMenuMeta">@username</p>
+                  </div>
+                </div>
+                <button id="btnOpenSettings" class="secondary-btn user-menu-action" type="button">Settings</button>
+                <button id="btnLogout" class="ghost-btn user-menu-action" type="button">Logout</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </header>
+
       <div id="driveMessage" class="drive-message hidden"></div>
 
-      <div class="layout">
-        <aside class="sidebar">
-          <h3>Folders</h3>
-          <ul id="folderTree"></ul>
+      <section class="drive-stats">
+        <article class="glass-panel stat-card">
+          <span class="stat-label">Current Folder</span>
+          <strong id="statFolderName">Root</strong>
+        </article>
+        <article class="glass-panel stat-card">
+          <span class="stat-label">Entries Visible</span>
+          <strong id="statEntryCount">0</strong>
+        </article>
+        <article class="glass-panel stat-card">
+          <span class="stat-label">Transfers Active</span>
+          <strong id="statTransferCount">0</strong>
+        </article>
+      </section>
+
+      <main class="drive-layout">
+        <aside class="glass-panel sidebar">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">Folder Tree</span>
+              <h3>Folders</h3>
+            </div>
+          </div>
+          <ul id="folderTree" class="folder-tree"></ul>
         </aside>
 
-        <main class="main-panel" id="dropZone">
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Size</th>
-                <th>Type</th>
-                <th>Upload Date</th>
-              </tr>
-            </thead>
-            <tbody id="fileRows"></tbody>
-          </table>
-        </main>
-      </div>
+        <section class="content-stack">
+          <section class="glass-panel main-panel" id="dropZone">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Explorer</span>
+                <h3>Files</h3>
+              </div>
+              <span class="drop-hint">Drag files here or use the native selectors.</span>
+            </div>
 
-      <section class="progress-panel">
-        <h3>Transfers</h3>
-        <div id="progressList"></div>
-      </section>
+            <div id="emptyState" class="empty-state hidden">
+              <strong>No files yet</strong>
+              <p>Use Upload or Upload Folder to populate this workspace.</p>
+            </div>
+
+            <div class="table-shell">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Size</th>
+                    <th>Type</th>
+                    <th>Upload Date</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="fileRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="glass-panel progress-panel">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Transfer Queue</span>
+                <h3>Transfers</h3>
+              </div>
+              <span class="panel-caption">Uploads e downloads com snapshot persistente.</span>
+            </div>
+            <div id="progressList" class="progress-list">
+              <p class="empty-progress">Nenhuma transferência em andamento.</p>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div id="newFolderModal" class="hidden modal">
+      <div class="modal-card modal-form-card">
+        <span class="eyebrow">Folder</span>
+        <h3>Nova Pasta</h3>
+        <input id="newFolderInput" type="text" placeholder="Nome da pasta" />
+        <div class="modal-actions">
+          <button id="btnNewFolderCancel" class="ghost-btn">Cancelar</button>
+          <button id="btnNewFolderConfirm" class="primary-btn">Criar</button>
+        </div>
+      </div>
     </div>
 
     <div id="previewModal" class="hidden modal">
-      <div class="modal-card">
-        <button id="closePreview" class="close-btn">Close</button>
+      <div class="modal-card preview-card">
+        <button id="closePreview" class="ghost-btn close-btn">Close</button>
         <img id="previewImage" alt="preview" />
       </div>
     </div>
-  </div>
 
+    <div id="settingsModal" class="hidden modal">
+      <div class="modal-card modal-form-card settings-card">
+        <div class="panel-heading">
+          <div>
+            <span class="eyebrow">Settings</span>
+            <h3>Workspace Settings</h3>
+          </div>
+        </div>
+        <div class="settings-grid">
+          <div class="settings-block">
+            <label for="settingsChunkSize" class="settings-label">Chunked uploads (&gt; 2 GiB)</label>
+            <select id="settingsChunkSize">
+              <option value="8388608">8 MiB</option>
+              <option value="33554432">32 MiB</option>
+              <option value="67108864">64 MiB</option>
+            </select>
+            <p>&le; 2 GiB continuam como arquivo único no Telegram.</p>
+            <p id="settingsChunkSummary">Acima de 2 GiB, o app usa chunks de 32 MiB.</p>
+          </div>
+          <div class="settings-block">
+            <label for="settingsParallelism" class="settings-label">Parallel uploads</label>
+            <input id="settingsParallelism" type="number" min="1" max="48" />
+          </div>
+          <div class="settings-block">
+            <label class="settings-checkbox">
+              <input id="settingsEncrypt" type="checkbox" />
+              <span>Encrypt chunked uploads</span>
+            </label>
+          </div>
+          <div class="settings-block">
+            <span class="settings-label">Cache</span>
+            <p>Disk cache enabled for downloaded chunks and single objects.</p>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button id="btnSettingsClose" class="ghost-btn" type="button">Close</button>
+          <button id="btnSettingsSave" class="primary-btn" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="apiHelpModal" class="hidden modal">
+      <div class="modal-card modal-form-card api-help-card">
+        <span class="eyebrow">API Access</span>
+        <h3>Como obter API ID e API Hash</h3>
+        <ol class="help-steps">
+          <li>Acesse <a id="apiHelpLink" href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">my.telegram.org/apps</a>.</li>
+          <li>Faça login com o mesmo número de telefone da sua conta Telegram.</li>
+          <li>Abra a seção <strong>API development tools</strong>.</li>
+          <li>Crie um app preenchendo nome, short name e plataforma.</li>
+          <li>Copie o <code>api_id</code> e o <code>api_hash</code> exibidos.</li>
+          <li>Volte ao Telegram Drive e preencha os campos de login.</li>
+        </ol>
+        <div class="modal-actions">
+          <button id="btnApiHelpClose" class="ghost-btn" type="button">Fechar</button>
+          <a class="primary-btn link-btn" href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">Abrir página oficial</a>
+        </div>
+      </div>
+    </div>
+  </div>
   <script src="app.js"></script>
 </body>
 </html>

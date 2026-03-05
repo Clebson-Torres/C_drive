@@ -11,6 +11,8 @@ mod models;
 mod progress;
 mod session_store;
 mod telegram;
+#[cfg(test)]
+mod transfer_matrix;
 mod uploader;
 
 use auth::AuthService;
@@ -21,17 +23,21 @@ use dedup::DedupEngine;
 use downloader::DownloadService;
 use file_index::FileIndexService;
 use models::{
-    ApiResponse, AuthStartInput, AuthState, EntryKind, MoveInput, RenameInput, SearchQuery, SettingsDto,
+    ApiResponse, AuthPrefillDto, AuthStartInput, AuthState, EntryKind, MoveInput, RenameInput,
+    SearchQuery, SettingsDto,
 };
 use progress::ProgressHub;
 use sha2::Digest;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tauri::{Emitter, State};
 use telegram::TelegramClient;
 use tracing::{error, info};
 use uploader::UploadService;
 use walkdir::WalkDir;
+
+static LOG_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 #[derive(Clone)]
 struct AppState {
@@ -43,9 +49,13 @@ struct AppState {
     progress: ProgressHub,
 }
 
+// ─── Auth ──────────────────────────────────────────────────────────────────
+
 #[tauri::command]
-#[tracing::instrument(skip(state, input), name = "auth_start")]
-async fn auth_start(state: State<'_, AppState>, input: AuthStartInput) -> Result<ApiResponse<AuthState>, String> {
+async fn auth_start(
+    state: State<'_, AppState>,
+    input: AuthStartInput,
+) -> Result<ApiResponse<AuthState>, String> {
     Ok(map_response(
         state
             .auth
@@ -55,22 +65,53 @@ async fn auth_start(state: State<'_, AppState>, input: AuthStartInput) -> Result
 }
 
 #[tauri::command]
-#[tracing::instrument(skip(state, code), name = "auth_verify_code")]
-async fn auth_verify_code(state: State<'_, AppState>, code: String) -> Result<ApiResponse<AuthState>, String> {
+async fn auth_verify_code(
+    state: State<'_, AppState>,
+    code: String,
+) -> Result<ApiResponse<AuthState>, String> {
     Ok(map_response(state.auth.verify_code(code).await))
 }
 
 #[tauri::command]
-#[tracing::instrument(skip(state, password), name = "auth_verify_password")]
-async fn auth_verify_password(state: State<'_, AppState>, password: String) -> Result<ApiResponse<AuthState>, String> {
+async fn auth_verify_password(
+    state: State<'_, AppState>,
+    password: String,
+) -> Result<ApiResponse<AuthState>, String> {
     Ok(map_response(state.auth.verify_password(password).await))
 }
 
 #[tauri::command]
-#[tracing::instrument(skip(state), name = "auth_status")]
 async fn auth_status(state: State<'_, AppState>) -> Result<ApiResponse<AuthState>, String> {
     Ok(ApiResponse::ok(state.auth.status()))
 }
+
+#[tauri::command]
+async fn auth_profile(
+    state: State<'_, AppState>,
+) -> Result<ApiResponse<models::UserProfileDto>, String> {
+    Ok(map_response(state.auth.profile().await))
+}
+
+#[tauri::command]
+async fn auth_prefill(
+    state: State<'_, AppState>,
+) -> Result<ApiResponse<Option<AuthPrefillDto>>, String> {
+    Ok(map_response(state.auth.prefill()))
+}
+
+#[tauri::command]
+async fn auth_logout(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ApiResponse<AuthState>, String> {
+    let response = map_response(state.auth.logout().await);
+    if response.ok {
+        let _ = app.emit("auth_state_changed", AuthState::LoggedOut);
+    }
+    Ok(response)
+}
+
+// ─── Listagem ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn list_folder(
@@ -81,24 +122,51 @@ async fn list_folder(
     _sort: Option<String>,
     _direction: Option<String>,
 ) -> Result<ApiResponse<models::FolderListResponse>, String> {
-    Ok(map_response(state.index.list_folder(folder_id, page, page_size)))
+    Ok(map_response(
+        state.index.list_folder(folder_id, page, page_size),
+    ))
 }
 
 #[tauri::command]
-async fn create_folder(state: State<'_, AppState>, parent_id: Option<i64>, name: String) -> Result<ApiResponse<models::Folder>, String> {
+async fn folder_tree(
+    state: State<'_, AppState>,
+) -> Result<ApiResponse<Vec<models::Folder>>, String> {
+    Ok(map_response(state.index.list_tree()))
+}
+
+#[tauri::command]
+async fn create_folder(
+    state: State<'_, AppState>,
+    parent_id: Option<i64>,
+    name: String,
+) -> Result<ApiResponse<models::Folder>, String> {
     Ok(map_response(state.index.create_folder(parent_id, name)))
 }
 
 #[tauri::command]
-async fn rename_entry(state: State<'_, AppState>, input: RenameInput) -> Result<ApiResponse<()>, String> {
+async fn rename_entry(
+    state: State<'_, AppState>,
+    input: RenameInput,
+) -> Result<ApiResponse<()>, String> {
     let is_folder = matches!(input.kind, EntryKind::Folder);
-    Ok(map_response(state.db.rename_entry(input.entry_id, &input.new_name, is_folder)))
+    Ok(map_response(state.db.rename_entry(
+        input.entry_id,
+        &input.new_name,
+        is_folder,
+    )))
 }
 
 #[tauri::command]
-async fn move_entry(state: State<'_, AppState>, input: MoveInput) -> Result<ApiResponse<()>, String> {
+async fn move_entry(
+    state: State<'_, AppState>,
+    input: MoveInput,
+) -> Result<ApiResponse<()>, String> {
     let is_folder = matches!(input.kind, EntryKind::Folder);
-    Ok(map_response(state.db.move_entry(input.entry_id, input.target_folder_id, is_folder)))
+    Ok(map_response(state.db.move_entry(
+        input.entry_id,
+        input.target_folder_id,
+        is_folder,
+    )))
 }
 
 #[tauri::command]
@@ -117,10 +185,57 @@ async fn search(
     })))
 }
 
+// ─── Deleção ───────────────────────────────────────────────────────────────
+
+/// Apaga um arquivo do banco de dados local.
+/// Nota: os chunks no Telegram NÃO são deletados (limitação da API do Telegram).
+/// O ref_count é decrementado corretamente para deduplicação futura.
 #[tauri::command]
-async fn upload_files(state: State<'_, AppState>, folder_id: i64, paths: Vec<String>) -> Result<ApiResponse<Vec<i64>>, String> {
+async fn delete_file(state: State<'_, AppState>, file_id: i64) -> Result<ApiResponse<()>, String> {
+    Ok(map_response(state.db.delete_file(file_id)))
+}
+
+/// Apaga uma pasta e todo o seu conteúdo do banco local (cascata).
+/// A pasta raiz não pode ser apagada.
+#[tauri::command]
+async fn delete_folder(
+    state: State<'_, AppState>,
+    folder_id: i64,
+) -> Result<ApiResponse<()>, String> {
+    Ok(map_response(state.db.delete_folder(folder_id)))
+}
+
+// ─── Upload ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn upload_files(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    paths: Vec<String>,
+) -> Result<ApiResponse<()>, String> {
+    if paths.is_empty() {
+        return Ok(ApiResponse::err("nenhum arquivo selecionado"));
+    }
     let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    Ok(upload_path_list(state.inner(), folder_id, path_bufs).await)
+    let inner = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let settings = inner.db.load_settings().unwrap_or_default();
+        for p in path_bufs {
+            let result = inner
+                .uploader
+                .upload_file(
+                    folder_id,
+                    p.clone(),
+                    settings.max_parallelism,
+                    settings.chunk_size_bytes,
+                )
+                .await;
+            if let Err(e) = result {
+                error!(path = %p.display(), error = %e, "upload failed");
+            }
+        }
+    });
+    Ok(ApiResponse::ok(()))
 }
 
 #[tauri::command]
@@ -128,25 +243,40 @@ async fn upload_folder(
     state: State<'_, AppState>,
     folder_id: i64,
     directory_path: String,
-) -> Result<ApiResponse<Vec<i64>>, String> {
+) -> Result<ApiResponse<()>, String> {
     let root = PathBuf::from(&directory_path);
     if !root.exists() || !root.is_dir() {
-        return Ok(ApiResponse::err("invalid directory path".to_string()));
+        return Ok(ApiResponse::err("caminho de diretório inválido"));
     }
-
-    let mut files = Vec::new();
-    for entry in WalkDir::new(&root).into_iter().flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            files.push(path.to_path_buf());
-        }
-    }
+    let mut files: Vec<PathBuf> = WalkDir::new(&root)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect();
     files.sort();
     if files.is_empty() {
-        return Ok(ApiResponse::err("selected folder has no files".to_string()));
+        return Ok(ApiResponse::err("a pasta selecionada não contém arquivos"));
     }
-
-    Ok(upload_path_list(state.inner(), folder_id, files).await)
+    let inner = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let settings = inner.db.load_settings().unwrap_or_default();
+        for p in files {
+            let result = inner
+                .uploader
+                .upload_file(
+                    folder_id,
+                    p.clone(),
+                    settings.max_parallelism,
+                    settings.chunk_size_bytes,
+                )
+                .await;
+            if let Err(e) = result {
+                error!(path = %p.display(), error = %e, "upload failed");
+            }
+        }
+    });
+    Ok(ApiResponse::ok(()))
 }
 
 #[tauri::command]
@@ -162,7 +292,6 @@ async fn pick_files_native() -> Result<ApiResponse<Vec<String>>, String> {
     })
     .await
     .map_err(|e| e.to_string())?;
-
     Ok(ApiResponse::ok(selected))
 }
 
@@ -176,28 +305,10 @@ async fn pick_folder_native() -> Result<ApiResponse<Option<String>>, String> {
     })
     .await
     .map_err(|e| e.to_string())?;
-
     Ok(ApiResponse::ok(selected))
 }
 
-async fn upload_path_list(state: &AppState, folder_id: i64, paths: Vec<PathBuf>) -> ApiResponse<Vec<i64>> {
-    let settings = state.db.load_settings().unwrap_or_default();
-    let mut ids = Vec::new();
-    for p in paths {
-        let result = state
-            .uploader
-            .upload_file(folder_id, p.clone(), settings.max_parallelism)
-            .await;
-        match result {
-            Ok(id) => ids.push(id),
-            Err(e) => {
-                error!(path = %p.display(), error = %e, "upload failed");
-                return ApiResponse::err(e.to_string());
-            }
-        }
-    }
-    ApiResponse::ok(ids)
-}
+// ─── Download ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn download_file(
@@ -209,20 +320,42 @@ async fn download_file(
     Ok(map_response(
         state
             .downloader
-            .download_file(file_id, PathBuf::from(destination_path), settings.max_parallelism)
+            .download_file(
+                file_id,
+                PathBuf::from(destination_path),
+                settings.max_parallelism,
+            )
             .await,
     ))
 }
 
 #[tauri::command]
-async fn preview_image(state: State<'_, AppState>, file_id: i64) -> Result<ApiResponse<models::PreviewResponse>, String> {
-    Ok(map_response(state.downloader.materialize_preview(file_id).await))
+async fn preview_image(
+    state: State<'_, AppState>,
+    file_id: i64,
+) -> Result<ApiResponse<models::PreviewResponse>, String> {
+    Ok(map_response(
+        state.downloader.materialize_preview(file_id).await,
+    ))
 }
 
+// ─── Progresso e configuração ──────────────────────────────────────────────
+
 #[tauri::command]
-async fn transfer_cancel(state: State<'_, AppState>, job_id: String) -> Result<ApiResponse<()>, String> {
+async fn transfer_cancel(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<ApiResponse<()>, String> {
     state.progress.cancel(&job_id);
     Ok(ApiResponse::ok(()))
+}
+
+/// Retorna todos os transfers ativos (para o frontend reconstruir o estado após reconexão).
+#[tauri::command]
+async fn transfers_snapshot(
+    state: State<'_, AppState>,
+) -> Result<ApiResponse<Vec<models::TransferStatus>>, String> {
+    Ok(ApiResponse::ok(state.progress.snapshot()))
 }
 
 #[tauri::command]
@@ -234,14 +367,18 @@ async fn settings_get(state: State<'_, AppState>) -> Result<ApiResponse<Settings
 }
 
 #[tauri::command]
-async fn settings_set(state: State<'_, AppState>, settings: SettingsDto) -> Result<ApiResponse<()>, String> {
-    Ok(map_response(state.db.set_setting_json("app.settings", &settings)))
+async fn settings_set(
+    state: State<'_, AppState>,
+    settings: SettingsDto,
+) -> Result<ApiResponse<()>, String> {
+    Ok(map_response(
+        state
+            .db
+            .set_setting_json("app.settings", &settings.normalized()),
+    ))
 }
 
-#[tauri::command]
-async fn folder_tree(state: State<'_, AppState>) -> Result<ApiResponse<Vec<models::Folder>>, String> {
-    Ok(map_response(state.index.list_tree()))
-}
+// ─── Helpers ───────────────────────────────────────────────────────────────
 
 fn map_response<T>(res: Result<T, models::AppError>) -> ApiResponse<T> {
     match res {
@@ -251,22 +388,36 @@ fn map_response<T>(res: Result<T, models::AppError>) -> ApiResponse<T> {
 }
 
 fn init_tracing() {
+    let log_root = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("logs")
+        .join("telegram");
+    let _ = std::fs::create_dir_all(&log_root);
+    let file_appender = tracing_appender::rolling::daily(log_root, "runtime.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    let _ = LOG_GUARD.set(guard);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "telegram_drive=info,info".into()),
+                .unwrap_or_else(|_| "telegram_drive=debug,info".into()),
         )
+        .with_writer(non_blocking)
+        .with_ansi(false)
         .compact()
         .init();
 }
 
 fn app_data_root() -> models::AppResult<PathBuf> {
-    let mut path = dirs::data_dir()
-        .ok_or_else(|| models::AppError::Validation("unable to resolve data directory".to_string()))?;
+    let mut path = dirs::data_dir().ok_or_else(|| {
+        models::AppError::Validation("unable to resolve data directory".to_string())
+    })?;
     path.push("telegram-drive");
     std::fs::create_dir_all(&path)?;
     Ok(path)
 }
+
+// ─── main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
@@ -344,7 +495,6 @@ async fn main() {
         downloader,
         progress: progress.clone(),
     };
-
     let state_for_events = Arc::new(shared_state.clone());
 
     let app = tauri::Builder::default()
@@ -354,11 +504,17 @@ async fn main() {
             auth_verify_code,
             auth_verify_password,
             auth_status,
+            auth_profile,
+            auth_prefill,
+            auth_logout,
             list_folder,
+            folder_tree,
             create_folder,
             rename_entry,
             move_entry,
             search,
+            delete_file,
+            delete_folder,
             upload_files,
             upload_folder,
             pick_files_native,
@@ -366,20 +522,34 @@ async fn main() {
             download_file,
             preview_image,
             transfer_cancel,
+            transfers_snapshot,
             settings_get,
             settings_set,
-            folder_tree
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
             let mut rx = state_for_events.progress.subscribe();
+
+            // Emite eventos de progresso para o frontend em tempo real.
+            // O canal tem capacidade 8192 para não perder eventos durante pico de chunks paralelos.
             tauri::async_runtime::spawn(async move {
-                while let Ok(status) = rx.recv().await {
-                    let _ = app_handle.emit("transfer_progress", &status);
-                    let _ = app_handle.emit("transfer_state_changed", &status);
+                loop {
+                    match rx.recv().await {
+                        Ok(status) => {
+                            let _ = app_handle.emit("transfer_progress", &status);
+                            let _ = app_handle.emit("transfer_state_changed", &status);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            error!("progress event loop lagged by {n} messages");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
             });
-            let _ = app.handle().emit("auth_state_changed", state_for_events.auth.status());
+
+            let _ = app
+                .handle()
+                .emit("auth_state_changed", state_for_events.auth.status());
             Ok(())
         })
         .build(tauri::generate_context!());

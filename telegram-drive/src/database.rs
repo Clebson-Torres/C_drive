@@ -1,6 +1,10 @@
-use crate::models::{AppError, AppResult, FileEntry, Folder, FolderListResponse, SearchQuery, SettingsDto};
+use crate::models::{
+    AppError, AppResult, FileEntry, Folder, FolderListResponse, SearchQuery, SettingsDto,
+    StorageMode,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +14,7 @@ pub struct ChunkIndexRow {
     pub telegram_file_id: String,
     pub size: i64,
     pub ref_count: i64,
+    pub nonce_b64: String,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +25,8 @@ pub struct NewFileRecord {
     pub folder_id: i64,
     pub mime_type: String,
     pub original_path: Option<String>,
+    pub storage_mode: StorageMode,
+    pub telegram_file_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +94,9 @@ impl Database {
                 mime_type TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                original_path TEXT NULL
+                original_path TEXT NULL,
+                storage_mode TEXT NOT NULL DEFAULT 'chunked',
+                telegram_file_id TEXT NULL
             );
 
             CREATE TABLE IF NOT EXISTS chunks (
@@ -107,6 +116,7 @@ impl Database {
                 telegram_file_id TEXT NOT NULL,
                 size INTEGER NOT NULL,
                 ref_count INTEGER NOT NULL,
+                nonce_b64 TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -145,6 +155,29 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
             CREATE INDEX IF NOT EXISTS idx_chunks_part ON chunks(file_id, part_index);
             ",
+        )?;
+
+        if !has_column(&conn, "files", "storage_mode")? {
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN storage_mode TEXT NOT NULL DEFAULT 'chunked'",
+                [],
+            )?;
+        }
+        if !has_column(&conn, "files", "telegram_file_id")? {
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN telegram_file_id TEXT NULL",
+                [],
+            )?;
+        }
+        if !has_column(&conn, "chunk_index", "nonce_b64")? {
+            conn.execute(
+                "ALTER TABLE chunk_index ADD COLUMN nonce_b64 TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_storage_mode ON files(storage_mode)",
+            [],
         )?;
         Ok(())
     }
@@ -186,6 +219,7 @@ impl Database {
             params![name, parent_id, now, now],
         )?;
         let id = conn.last_insert_rowid();
+        drop(conn);
         self.get_folder(id)
     }
 
@@ -220,10 +254,17 @@ impl Database {
             created_at: parse_ts(row.get::<_, String>(6)?)?,
             updated_at: parse_ts(row.get::<_, String>(7)?)?,
             original_path: row.get(8)?,
+            storage_mode: parse_storage_mode(row.get::<_, String>(9)?)?,
+            telegram_file_id: row.get(10)?,
         })
     }
 
-    pub fn list_folder(&self, folder_id: i64, page: u32, page_size: u32) -> AppResult<FolderListResponse> {
+    pub fn list_folder(
+        &self,
+        folder_id: i64,
+        page: u32,
+        page_size: u32,
+    ) -> AppResult<FolderListResponse> {
         let offset = (page * page_size) as i64;
         let limit = page_size as i64;
         let conn = self.lock_conn()?;
@@ -239,7 +280,7 @@ impl Database {
 
         let files = {
             let mut stmt = conn.prepare(
-                "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path
+                "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id
                  FROM files WHERE folder_id = ?1 ORDER BY name ASC LIMIT ?2 OFFSET ?3",
             )?;
             let rows = stmt.query_map(params![folder_id, limit, offset], Self::file_from_row)?;
@@ -251,7 +292,6 @@ impl Database {
             params![folder_id],
             |row| row.get(0),
         )?;
-
         let total_files: u64 = conn.query_row(
             "SELECT COUNT(1) FROM files WHERE folder_id = ?1",
             params![folder_id],
@@ -272,24 +312,17 @@ impl Database {
         let needle = format!("%{}%", query.query);
         let conn = self.lock_conn()?;
 
-        let files_sql = if query.folder_id.is_some() {
-            "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path
-             FROM files
-             WHERE folder_id = ?1 AND name LIKE ?2
-             ORDER BY name ASC LIMIT ?3 OFFSET ?4"
-        } else {
-            "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path
-             FROM files
-             WHERE name LIKE ?1
-             ORDER BY name ASC LIMIT ?2 OFFSET ?3"
-        };
+        let files_sql_folder = "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id
+             FROM files WHERE folder_id = ?1 AND name LIKE ?2 ORDER BY name ASC LIMIT ?3 OFFSET ?4";
+        let files_sql_all = "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id
+             FROM files WHERE name LIKE ?1 ORDER BY name ASC LIMIT ?2 OFFSET ?3";
 
         let files = if let Some(fid) = query.folder_id {
-            let mut stmt = conn.prepare(files_sql)?;
+            let mut stmt = conn.prepare(files_sql_folder)?;
             let rows = stmt.query_map(params![fid, needle, limit, offset], Self::file_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()?
         } else {
-            let mut stmt = conn.prepare(files_sql)?;
+            let mut stmt = conn.prepare(files_sql_all)?;
             let rows = stmt.query_map(params![needle, limit, offset], Self::file_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -331,6 +364,7 @@ impl Database {
             )
             .optional()?;
         if let Some(id) = canonical_id {
+            drop(conn);
             return self.get_file(id).map(Some);
         }
         Ok(None)
@@ -339,14 +373,17 @@ impl Database {
     pub fn get_file(&self, id: i64) -> AppResult<FileEntry> {
         let conn = self.lock_conn()?;
         conn.query_row(
-            "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path FROM files WHERE id=?1",
+            "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id FROM files WHERE id=?1",
             params![id],
             Self::file_from_row,
         )
         .map_err(AppError::from)
     }
 
-    pub fn get_chunks_for_file(&self, file_id: i64) -> AppResult<Vec<(i64, String, String, i64, String)>> {
+    pub fn get_chunks_for_file(
+        &self,
+        file_id: i64,
+    ) -> AppResult<Vec<(i64, String, String, i64, String)>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT part_index, hash, telegram_file_id, size, nonce_b64
@@ -362,7 +399,7 @@ impl Database {
         let conn = self.lock_conn()?;
         let row = conn
             .query_row(
-                "SELECT hash, telegram_file_id, size, ref_count FROM chunk_index WHERE hash = ?1",
+                "SELECT hash, telegram_file_id, size, ref_count, nonce_b64 FROM chunk_index WHERE hash = ?1",
                 params![hash],
                 |r| {
                     Ok(ChunkIndexRow {
@@ -370,6 +407,7 @@ impl Database {
                         telegram_file_id: r.get(1)?,
                         size: r.get(2)?,
                         ref_count: r.get(3)?,
+                        nonce_b64: r.get(4)?,
                     })
                 },
             )
@@ -386,8 +424,8 @@ impl Database {
         let tx = conn.transaction()?;
         let now = Self::now().to_rfc3339();
         tx.execute(
-            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 file.name,
                 file.size,
@@ -396,7 +434,9 @@ impl Database {
                 file.mime_type,
                 now,
                 now,
-                file.original_path
+                file.original_path,
+                storage_mode_to_str(&file.storage_mode),
+                file.telegram_file_id
             ],
         )?;
         let file_id = tx.last_insert_rowid();
@@ -415,23 +455,18 @@ impl Database {
                     now
                 ],
             )?;
-
             tx.execute(
-                "INSERT INTO chunk_index(hash, telegram_file_id, size, ref_count, created_at, updated_at)
-                 VALUES(?1, ?2, ?3, 1, ?4, ?5)
-                 ON CONFLICT(hash) DO UPDATE SET
-                    ref_count = chunk_index.ref_count + 1,
-                    updated_at = excluded.updated_at",
-                params![chunk.hash, chunk.telegram_file_id, chunk.size, now, now],
+                "INSERT INTO chunk_index(hash, telegram_file_id, size, ref_count, nonce_b64, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, 1, ?4, ?5, ?6)
+                 ON CONFLICT(hash) DO UPDATE SET ref_count = chunk_index.ref_count + 1, updated_at = excluded.updated_at",
+                params![chunk.hash, chunk.telegram_file_id, chunk.size, chunk.nonce_b64, now, now],
             )?;
         }
 
         tx.execute(
             "INSERT INTO file_hash_index(hash, canonical_file_id, ref_count, created_at, updated_at)
              VALUES(?1, ?2, 1, ?3, ?4)
-             ON CONFLICT(hash) DO UPDATE SET
-                ref_count = file_hash_index.ref_count + 1,
-                updated_at = excluded.updated_at",
+             ON CONFLICT(hash) DO UPDATE SET ref_count = file_hash_index.ref_count + 1, updated_at = excluded.updated_at",
             params![file.hash, file_id, now, now],
         )?;
 
@@ -447,17 +482,27 @@ impl Database {
     ) -> AppResult<i64> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
-
-        let source: (i64, String, i64, String, String, Option<String>) = tx.query_row(
-            "SELECT id, hash, size, mime_type, created_at, original_path FROM files WHERE id=?1",
-            params![source_file_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-        )?;
-
+        let source: (i64, String, i64, String, String, Option<String>, String, Option<String>) =
+            tx.query_row(
+                "SELECT id, hash, size, mime_type, created_at, original_path, storage_mode, telegram_file_id FROM files WHERE id=?1",
+                params![source_file_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )?;
         let now = Self::now().to_rfc3339();
         tx.execute(
-            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 destination_name,
                 source.2,
@@ -466,11 +511,12 @@ impl Database {
                 source.3,
                 source.4,
                 now,
-                source.5
+                source.5,
+                source.6,
+                source.7
             ],
         )?;
         let new_file_id = tx.last_insert_rowid();
-
         tx.execute(
             "INSERT INTO file_refs(file_id, target_file_id, created_at) VALUES(?1, ?2, ?3)",
             params![new_file_id, source_file_id, now],
@@ -480,24 +526,24 @@ impl Database {
             let mut stmt = tx.prepare(
                 "SELECT part_index, hash, telegram_file_id, size, nonce_b64 FROM chunks WHERE file_id = ?1 ORDER BY part_index ASC",
             )?;
-            let chunk_rows = stmt.query_map(params![source_file_id], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })?;
+            let chunk_rows = stmt
+                .query_map(params![source_file_id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
 
-            for row in chunk_rows {
-                let (part_index, hash, telegram_file_id, size, nonce_b64) = row?;
+            for (part_index, hash, telegram_file_id, size, nonce_b64) in chunk_rows {
                 tx.execute(
                     "INSERT INTO chunks(file_id, part_index, hash, telegram_file_id, size, nonce_b64, created_at)
                      VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![new_file_id, part_index, hash, telegram_file_id, size, nonce_b64, now],
                 )?;
-
                 tx.execute(
                     "UPDATE chunk_index SET ref_count = ref_count + 1, updated_at = ?2 WHERE hash = ?1",
                     params![hash, now],
@@ -509,7 +555,6 @@ impl Database {
             "UPDATE file_hash_index SET ref_count = ref_count + 1, updated_at = ?2 WHERE hash = ?1",
             params![source.1, now],
         )?;
-
         tx.commit()?;
         Ok(new_file_id)
     }
@@ -548,6 +593,107 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_file(&self, file_id: i64) -> AppResult<()> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let now = Self::now().to_rfc3339();
+
+        let file_hash: String = tx.query_row(
+            "SELECT hash FROM files WHERE id = ?1",
+            params![file_id],
+            |r| r.get(0),
+        )?;
+
+        {
+            let mut stmt = tx.prepare("SELECT hash FROM chunks WHERE file_id = ?1")?;
+            let hashes: Vec<String> = stmt
+                .query_map(params![file_id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            for hash in hashes {
+                tx.execute(
+                    "UPDATE chunk_index SET ref_count = ref_count - 1, updated_at = ?2 WHERE hash = ?1",
+                    params![hash, now],
+                )?;
+                tx.execute(
+                    "DELETE FROM chunk_index WHERE hash = ?1 AND ref_count <= 0",
+                    params![hash],
+                )?;
+            }
+        }
+
+        tx.execute(
+            "UPDATE file_hash_index SET ref_count = ref_count - 1, updated_at = ?2 WHERE hash = ?1",
+            params![file_hash, now],
+        )?;
+        tx.execute(
+            "DELETE FROM file_hash_index WHERE hash = ?1 AND ref_count <= 0",
+            params![file_hash],
+        )?;
+
+        tx.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_folder(&self, folder_id: i64) -> AppResult<()> {
+        let is_root = {
+            let conn = self.lock_conn()?;
+            conn.query_row(
+                "SELECT id FROM folders WHERE id = ?1 AND parent_id IS NULL",
+                params![folder_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some()
+        };
+        if is_root {
+            return Err(AppError::Validation(
+                "não é possível apagar a pasta raiz".to_string(),
+            ));
+        }
+
+        let folder_ids = self.collect_descendant_folder_ids(folder_id)?;
+        let file_ids = self.collect_files_in_folders(&folder_ids)?;
+
+        for file_id in file_ids {
+            self.delete_file(file_id)?;
+        }
+
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM folders WHERE id = ?1", params![folder_id])?;
+        Ok(())
+    }
+
+    fn collect_descendant_folder_ids(&self, root_folder_id: i64) -> AppResult<Vec<i64>> {
+        let conn = self.lock_conn()?;
+        let mut queue = VecDeque::from([root_folder_id]);
+        let mut all = Vec::new();
+        while let Some(folder_id) = queue.pop_front() {
+            all.push(folder_id);
+            let mut stmt = conn.prepare("SELECT id FROM folders WHERE parent_id = ?1")?;
+            let children = stmt
+                .query_map(params![folder_id], |r| r.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for child in children {
+                queue.push_back(child);
+            }
+        }
+        Ok(all)
+    }
+
+    fn collect_files_in_folders(&self, folder_ids: &[i64]) -> AppResult<Vec<i64>> {
+        let conn = self.lock_conn()?;
+        let mut file_ids = Vec::new();
+        for folder_id in folder_ids {
+            let mut stmt = conn.prepare("SELECT id FROM files WHERE folder_id = ?1")?;
+            let ids = stmt
+                .query_map(params![folder_id], |r| r.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            file_ids.extend(ids);
+        }
+        Ok(file_ids)
+    }
+
     pub fn set_setting_json<T: serde::Serialize>(&self, key: &str, value: &T) -> AppResult<()> {
         let conn = self.lock_conn()?;
         let json = serde_json::to_string(value)?;
@@ -559,7 +705,10 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_setting_json<T: serde::de::DeserializeOwned>(&self, key: &str) -> AppResult<Option<T>> {
+    pub fn get_setting_json<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> AppResult<Option<T>> {
         let conn = self.lock_conn()?;
         let val: Option<String> = conn
             .query_row(
@@ -575,7 +724,10 @@ impl Database {
     }
 
     pub fn load_settings(&self) -> AppResult<SettingsDto> {
-        Ok(self.get_setting_json("app.settings")?.unwrap_or_default())
+        Ok(self
+            .get_setting_json::<SettingsDto>("app.settings")?
+            .unwrap_or_default()
+            .normalized())
     }
 
     pub fn save_session_blob(&self, id: &str, blob: &[u8]) -> AppResult<()> {
@@ -600,6 +752,12 @@ impl Database {
         Ok(row)
     }
 
+    pub fn delete_session_blob(&self, id: &str) -> AppResult<()> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn list_all_folders(&self) -> AppResult<Vec<Folder>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
@@ -621,7 +779,46 @@ fn append_suffix(name: &str, n: u32) -> String {
 fn parse_ts(value: String) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(&value)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(value.len(), rusqlite::types::Type::Text, Box::new(e)))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                value.len(),
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for col in rows {
+        if col? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn parse_storage_mode(value: String) -> rusqlite::Result<StorageMode> {
+    match value.as_str() {
+        "single" => Ok(StorageMode::Single),
+        "chunked" => Ok(StorageMode::Chunked),
+        other => Err(rusqlite::Error::FromSqlConversionFailure(
+            other.len(),
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown storage mode {other}"),
+            )),
+        )),
+    }
+}
+
+fn storage_mode_to_str(mode: &StorageMode) -> &'static str {
+    match mode {
+        StorageMode::Single => "single",
+        StorageMode::Chunked => "chunked",
+    }
 }
 
 #[cfg(test)]

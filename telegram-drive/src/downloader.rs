@@ -1,7 +1,9 @@
 use crate::cache::LocalCdnCache;
 use crate::chunking::ChunkingEngine;
 use crate::database::Database;
-use crate::models::{AppError, AppResult, PreviewResponse, TransferState};
+use crate::models::{
+    AppError, AppResult, PreviewResponse, StorageMode, TransferPhase, TransferState,
+};
 use crate::progress::ProgressHub;
 use crate::telegram::TelegramClient;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -12,7 +14,7 @@ use std::sync::Arc;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
-use tracing::error;
+use tracing::{error, info_span, Instrument};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -41,15 +43,162 @@ impl DownloadService {
         }
     }
 
-    pub async fn download_file(&self, file_id: i64, destination_path: PathBuf, max_parallelism: usize) -> AppResult<()> {
+    pub async fn download_file(
+        &self,
+        file_id: i64,
+        destination_path: PathBuf,
+        max_parallelism: usize,
+    ) -> AppResult<()> {
         let file = self.db.get_file(file_id)?;
-        let chunks = self.db.get_chunks_for_file(file_id)?;
-
         let job_id = Uuid::new_v4().to_string();
         let total = file.size.max(0) as u64;
-        self.progress
-            .transition(&job_id, &file.name, TransferState::Running, 0, total, None);
 
+        self.progress.transition(
+            &job_id,
+            &file.name,
+            TransferState::Running,
+            TransferPhase::Downloading,
+            Some(file.storage_mode.clone()),
+            0,
+            total,
+            None,
+        );
+
+        let span = info_span!(
+            "download_file",
+            job_id = %job_id,
+            file_id,
+            storage_mode = ?file.storage_mode,
+            bytes_total = total
+        );
+
+        async move {
+            match file.storage_mode {
+                StorageMode::Single => {
+                    self.download_single_file(
+                        &job_id,
+                        &file.name,
+                        &file.hash,
+                        file.telegram_file_id,
+                        destination_path,
+                        total,
+                    )
+                    .await
+                }
+                StorageMode::Chunked => {
+                    self.download_chunked_file(
+                        &job_id,
+                        file_id,
+                        &file.name,
+                        destination_path,
+                        total,
+                        max_parallelism,
+                    )
+                    .await
+                }
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn download_single_file(
+        &self,
+        job_id: &str,
+        file_name: &str,
+        file_hash: &str,
+        telegram_file_id: Option<String>,
+        destination_path: PathBuf,
+        total: u64,
+    ) -> AppResult<()> {
+        if self.cache.copy_to(file_hash, &destination_path).await? {
+            self.progress.transition(
+                job_id,
+                file_name,
+                TransferState::Completed,
+                TransferPhase::Completed,
+                Some(StorageMode::Single),
+                total,
+                total,
+                None,
+            );
+            return Ok(());
+        }
+
+        let telegram_file_id = telegram_file_id.ok_or_else(|| {
+            AppError::Validation("single-object file missing telegram_file_id".to_string())
+        })?;
+        let temp_path = destination_path.with_extension("download.tmp");
+
+        self.telegram
+            .download_file_to_path(&telegram_file_id, &temp_path)
+            .await
+            .map_err(|e| {
+                self.progress.transition(
+                    job_id,
+                    file_name,
+                    TransferState::Failed,
+                    TransferPhase::Failed,
+                    Some(StorageMode::Single),
+                    0,
+                    total,
+                    Some(e.to_string()),
+                );
+                e
+            })?;
+
+        let bytes = fs::read(&temp_path).await?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hex::encode(hasher.finalize());
+        if digest != file_hash {
+            let _ = fs::remove_file(&temp_path).await;
+            let err = AppError::Validation(format!(
+                "single-object hash mismatch expected={} got={}",
+                file_hash, digest
+            ));
+            self.progress.transition(
+                job_id,
+                file_name,
+                TransferState::Failed,
+                TransferPhase::Failed,
+                Some(StorageMode::Single),
+                0,
+                total,
+                Some(err.to_string()),
+            );
+            return Err(err);
+        }
+
+        self.cache.import_file(file_hash, &temp_path).await?;
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::rename(&temp_path, &destination_path).await?;
+
+        self.progress.transition(
+            job_id,
+            file_name,
+            TransferState::Completed,
+            TransferPhase::Completed,
+            Some(StorageMode::Single),
+            total,
+            total,
+            None,
+        );
+        Ok(())
+    }
+
+    async fn download_chunked_file(
+        &self,
+        job_id: &str,
+        file_id: i64,
+        file_name: &str,
+        destination_path: PathBuf,
+        total: u64,
+        max_parallelism: usize,
+    ) -> AppResult<()> {
+        let chunks = self.db.get_chunks_for_file(file_id)?;
         let semaphore = Arc::new(Semaphore::new(compute_parallelism(max_parallelism)));
         let mut futures = FuturesUnordered::new();
 
@@ -64,7 +213,9 @@ impl DownloadService {
             futures.push(tokio::spawn(async move {
                 let _permit = permit;
                 if let Some(bytes) = cache.read_chunk(&hash).await? {
-                    return Ok::<(i64, String, String, Vec<u8>), AppError>((part_index, hash, nonce_b64, bytes));
+                    return Ok::<(i64, String, String, Vec<u8>), AppError>((
+                        part_index, hash, nonce_b64, bytes,
+                    ));
                 }
                 let bytes = tg.download_chunk(&telegram_file_id).await?;
                 cache.write_chunk(&hash, &bytes).await?;
@@ -83,21 +234,42 @@ impl DownloadService {
                     hasher.update(&decrypted);
                     let digest = hex::encode(hasher.finalize());
                     if digest != hash {
-                        return Err(AppError::Validation(format!(
+                        let err = AppError::Validation(format!(
                             "hash mismatch in part {} expected={} got={}",
                             part_index, hash, digest
-                        )));
+                        ));
+                        self.progress.transition(
+                            job_id,
+                            file_name,
+                            TransferState::Failed,
+                            TransferPhase::Failed,
+                            Some(StorageMode::Chunked),
+                            done,
+                            total,
+                            Some(err.to_string()),
+                        );
+                        return Err(err);
                     }
                     done += decrypted.len() as u64;
                     ordered.insert(part_index, decrypted);
-                    self.progress
-                        .transition(&job_id, &file.name, TransferState::Running, done, total, None);
+                    self.progress.transition(
+                        job_id,
+                        file_name,
+                        TransferState::Running,
+                        TransferPhase::Downloading,
+                        Some(StorageMode::Chunked),
+                        done,
+                        total,
+                        None,
+                    );
                 }
                 Ok(Err(e)) => {
                     self.progress.transition(
-                        &job_id,
-                        &file.name,
+                        job_id,
+                        file_name,
                         TransferState::Failed,
+                        TransferPhase::Failed,
+                        Some(StorageMode::Chunked),
                         done,
                         total,
                         Some(e.to_string()),
@@ -108,9 +280,11 @@ impl DownloadService {
                     let msg = format!("download worker join error: {join_err}");
                     error!(%msg);
                     self.progress.transition(
-                        &job_id,
-                        &file.name,
+                        job_id,
+                        file_name,
                         TransferState::Failed,
+                        TransferPhase::Failed,
+                        Some(StorageMode::Chunked),
                         done,
                         total,
                         Some(msg.clone()),
@@ -120,6 +294,17 @@ impl DownloadService {
             }
         }
 
+        self.progress.transition(
+            job_id,
+            file_name,
+            TransferState::Running,
+            TransferPhase::Reassembling,
+            Some(StorageMode::Chunked),
+            total,
+            total,
+            None,
+        );
+
         if let Some(parent) = destination_path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -127,15 +312,25 @@ impl DownloadService {
         write_reassembled_file(&partial, &ordered).await?;
         fs::rename(&partial, &destination_path).await?;
 
-        self.progress
-            .transition(&job_id, &file.name, TransferState::Completed, total, total, None);
+        self.progress.transition(
+            job_id,
+            file_name,
+            TransferState::Completed,
+            TransferPhase::Completed,
+            Some(StorageMode::Chunked),
+            total,
+            total,
+            None,
+        );
         Ok(())
     }
 
     pub async fn materialize_preview(&self, file_id: i64) -> AppResult<PreviewResponse> {
         let file = self.db.get_file(file_id)?;
         if !file.mime_type.starts_with("image/") {
-            return Err(AppError::Validation("preview is only available for image files".to_string()));
+            return Err(AppError::Validation(
+                "preview is only available for image files".to_string(),
+            ));
         }
 
         let ext = Path::new(&file.name)

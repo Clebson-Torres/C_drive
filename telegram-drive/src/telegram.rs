@@ -1,11 +1,13 @@
-use crate::models::{AppError, AppResult, AuthState};
+use crate::models::{AppError, AppResult, AuthState, UserProfileDto};
 use crate::session_store::PersistentSession;
-use grammers_client::message::InputMessage;
 use grammers_client::client::{LoginToken, PasswordToken};
+use grammers_client::message::InputMessage;
+use grammers_client::peer::Peer;
 use grammers_client::{Client, SignInError};
 use grammers_mtsender::SenderPool;
 use rand::Rng;
-use std::path::PathBuf;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::fs;
 use tokio::task::JoinHandle;
@@ -35,7 +37,8 @@ struct AuthContext {
 
 impl TelegramClient {
     pub async fn new(base_dir: PathBuf) -> AppResult<Self> {
-        let mock_mode = std::env::var("TELEGRAM_DRIVE_AUTH_MOCK")
+        let mock_mode = std::env::var("TGDRIVE_MOCK")
+            .or_else(|_| std::env::var("TELEGRAM_DRIVE_AUTH_MOCK"))
             .ok()
             .as_deref()
             == Some("1");
@@ -77,7 +80,12 @@ impl TelegramClient {
         matches!(self.auth_state(), AuthState::LoggedIn)
     }
 
-    pub async fn start_phone_auth(&self, phone: String, api_id: i32, api_hash: String) -> AppResult<AuthState> {
+    pub async fn start_phone_auth(
+        &self,
+        phone: String,
+        api_id: i32,
+        api_hash: String,
+    ) -> AppResult<AuthState> {
         if self.mock_mode {
             let mut auth = self.auth_lock()?;
             auth.phone = Some(phone);
@@ -137,14 +145,12 @@ impl TelegramClient {
 
         let (client, token) = {
             let mut auth = self.auth_lock()?;
-            let client = auth
-                .client
-                .clone()
-                .ok_or_else(|| AppError::Validation("telegram client not initialized".to_string()))?;
-            let token = auth
-                .login_token
-                .take()
-                .ok_or_else(|| AppError::Validation("missing login token; start auth first".to_string()))?;
+            let client = auth.client.clone().ok_or_else(|| {
+                AppError::Validation("telegram client not initialized".to_string())
+            })?;
+            let token = auth.login_token.take().ok_or_else(|| {
+                AppError::Validation("missing login token; start auth first".to_string())
+            })?;
             (client, token)
         };
 
@@ -161,7 +167,9 @@ impl TelegramClient {
                 auth.state = AuthState::AwaitingPassword;
                 Ok(AuthState::AwaitingPassword)
             }
-            Err(SignInError::InvalidCode) => Err(AppError::Validation("invalid login code".to_string())),
+            Err(SignInError::InvalidCode) => {
+                Err(AppError::Validation("invalid login code".to_string()))
+            }
             Err(e) => Err(AppError::Telegram(format!("sign_in failed: {e}"))),
         }
     }
@@ -179,18 +187,19 @@ impl TelegramClient {
 
         let (client, password_token) = {
             let mut auth = self.auth_lock()?;
-            let client = auth
-                .client
-                .clone()
-                .ok_or_else(|| AppError::Validation("telegram client not initialized".to_string()))?;
-            let token = auth
-                .password_token
-                .take()
-                .ok_or_else(|| AppError::Validation("2FA password token not available".to_string()))?;
+            let client = auth.client.clone().ok_or_else(|| {
+                AppError::Validation("telegram client not initialized".to_string())
+            })?;
+            let token = auth.password_token.take().ok_or_else(|| {
+                AppError::Validation("2FA password token not available".to_string())
+            })?;
             (client, token)
         };
 
-        match client.check_password(password_token, password.as_bytes()).await {
+        match client
+            .check_password(password_token, password.as_bytes())
+            .await
+        {
             Ok(_) => {
                 let mut auth = self.auth_lock()?;
                 auth.state = AuthState::LoggedIn;
@@ -210,6 +219,7 @@ impl TelegramClient {
         if self.mock_mode {
             return Ok(self.auth_state());
         }
+
         let (api_id, has_creds) = {
             let auth = self.auth_lock()?;
             (auth.api_id, auth.api_hash.is_some())
@@ -237,7 +247,89 @@ impl TelegramClient {
         Ok(auth.state.clone())
     }
 
-    pub async fn upload_chunk(&self, payload: Vec<u8>) -> AppResult<String> {
+    pub async fn profile(&self) -> AppResult<UserProfileDto> {
+        self.ensure_auth()?;
+        if self.mock_mode {
+            let auth = self.auth_lock()?;
+            let phone_masked = auth.phone.as_deref().map(mask_phone);
+            return Ok(UserProfileDto {
+                display_name: "Telegram User".to_string(),
+                username: Some("telegram_user".to_string()),
+                phone_masked,
+                avatar_path_opt: None,
+            });
+        }
+
+        let api_id = self
+            .auth_lock()?
+            .api_id
+            .ok_or_else(|| AppError::Telegram("missing api_id in auth context".to_string()))?;
+        let client = self.ensure_client(api_id).await?;
+        let me = client
+            .get_me()
+            .await
+            .map_err(|e| AppError::Telegram(format!("get_me failed: {e}")))?;
+
+        let avatar_path_opt = if let Some(photo) = Peer::User(me.clone()).photo(false).await {
+            let avatar_dir = self.store_dir.join("profile");
+            fs::create_dir_all(&avatar_dir).await?;
+            let avatar_path = avatar_dir.join(format!("avatar-{}.jpg", me.id()));
+            client
+                .download_media(&photo, &avatar_path)
+                .await
+                .map_err(|e| AppError::Telegram(format!("download profile photo failed: {e}")))?;
+            Some(avatar_path.to_string_lossy().to_string())
+        } else {
+            None
+        };
+
+        Ok(UserProfileDto {
+            display_name: {
+                let name = me.full_name();
+                if name.trim().is_empty() {
+                    me.username().unwrap_or("Telegram").to_string()
+                } else {
+                    name
+                }
+            },
+            username: me.username().map(ToOwned::to_owned),
+            phone_masked: me.phone().map(mask_phone),
+            avatar_path_opt,
+        })
+    }
+
+    pub async fn logout(&self) -> AppResult<()> {
+        if self.mock_mode {
+            let mut auth = self.auth_lock()?;
+            auth.state = AuthState::LoggedOut;
+            auth.client = None;
+            auth.runner_task = None;
+            auth.login_token = None;
+            auth.password_token = None;
+            return Ok(());
+        }
+
+        let maybe_client = self.auth_lock()?.client.clone();
+        if let Some(client) = maybe_client {
+            let _ = client.sign_out().await;
+        }
+
+        {
+            let mut auth = self.auth_lock()?;
+            if let Some(task) = auth.runner_task.take() {
+                task.abort();
+            }
+            auth.state = AuthState::LoggedOut;
+            auth.client = None;
+            auth.login_token = None;
+            auth.password_token = None;
+        }
+
+        let _ = fs::remove_file(&self.session_path).await;
+        Ok(())
+    }
+
+    pub async fn upload_chunk(&self, payload: Vec<u8>, original_name: &str) -> AppResult<String> {
         self.ensure_auth()?;
         if self.mock_mode {
             return self
@@ -256,32 +348,86 @@ impl TelegramClient {
             .ok_or_else(|| AppError::Telegram("missing api_id in auth context".to_string()))?;
         let client = self.ensure_client(api_id).await?;
         let peer = self.saved_messages_peer(&client).await?;
+        let file_name = sanitize_upload_name(original_name);
 
-        let temp_file = self.store_dir.join(format!("upload-{}.bin", Uuid::new_v4()));
-        fs::write(&temp_file, &payload).await?;
-        let result = self
-            .with_retry(|| {
-                let client = client.clone();
-                let temp_file = temp_file.clone();
-                async move {
-                    let uploaded = client.upload_file(&temp_file).await.map_err(|e| {
-                        AppError::Telegram(format!("telegram upload_file failed: {e}"))
+        self.with_retry(|| {
+            let client = client.clone();
+            let peer = peer;
+            let payload = payload.clone();
+            let file_name = file_name.clone();
+            async move {
+                let size = payload.len();
+                let mut stream = Cursor::new(payload);
+                let uploaded = client
+                    .upload_stream(&mut stream, size, file_name)
+                    .await
+                    .map_err(|e| {
+                        AppError::Telegram(format!("telegram upload_stream failed: {e}"))
                     })?;
-                    let message = client
-                        .send_message(
-                            peer,
-                            InputMessage::new().text("tgdrive-chunk").file(uploaded),
-                        )
-                        .await
-                        .map_err(|e| {
-                            AppError::Telegram(format!("telegram send_message failed: {e}"))
-                        })?;
-                    Ok(message.id().to_string())
-                }
-            })
-            .await;
-        let _ = fs::remove_file(&temp_file).await;
-        result
+                let message = client
+                    .send_message(
+                        peer,
+                        InputMessage::new().text("tgdrive-chunk").file(uploaded),
+                    )
+                    .await
+                    .map_err(|e| {
+                        AppError::Telegram(format!("telegram send_message failed: {e}"))
+                    })?;
+                Ok(message.id().to_string())
+            }
+        })
+        .await
+    }
+
+    pub async fn upload_file_path(&self, source_path: &Path) -> AppResult<String> {
+        self.ensure_auth()?;
+        if self.mock_mode {
+            return self
+                .with_retry(|| {
+                    let source_path = source_path.to_path_buf();
+                    async move {
+                        let id = Uuid::new_v4().to_string();
+                        let file_name = source_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("file.bin");
+                        let path = self.store_dir.join(format!("{id}-{file_name}"));
+                        fs::copy(&source_path, path).await?;
+                        Ok(id)
+                    }
+                })
+                .await;
+        }
+
+        let api_id = self
+            .auth_lock()?
+            .api_id
+            .ok_or_else(|| AppError::Telegram("missing api_id in auth context".to_string()))?;
+        let client = self.ensure_client(api_id).await?;
+        let peer = self.saved_messages_peer(&client).await?;
+        let source_path = source_path.to_path_buf();
+
+        self.with_retry(|| {
+            let client = client.clone();
+            let source_path = source_path.clone();
+            async move {
+                let uploaded = client
+                    .upload_file(&source_path)
+                    .await
+                    .map_err(|e| AppError::Telegram(format!("telegram upload_file failed: {e}")))?;
+                let message = client
+                    .send_message(
+                        peer,
+                        InputMessage::new().text("tgdrive-file").file(uploaded),
+                    )
+                    .await
+                    .map_err(|e| {
+                        AppError::Telegram(format!("telegram send_message failed: {e}"))
+                    })?;
+                Ok(message.id().to_string())
+            }
+        })
+        .await
     }
 
     pub async fn download_chunk(&self, telegram_file_id: &str) -> AppResult<Vec<u8>> {
@@ -309,25 +455,25 @@ impl TelegramClient {
         let client = self.ensure_client(api_id).await?;
         let peer = self.saved_messages_peer(&client).await?;
 
-        let temp_file = self.store_dir.join(format!("download-{}.bin", Uuid::new_v4()));
+        let temp_file = self
+            .store_dir
+            .join(format!("download-{}.bin", Uuid::new_v4()));
         let result = self
             .with_retry(|| {
                 let client = client.clone();
                 let temp_file = temp_file.clone();
+                let peer = peer;
                 async move {
                     let messages = client
                         .get_messages_by_id(peer, &[message_id])
                         .await
                         .map_err(|e| {
-                            AppError::Telegram(format!(
-                                "telegram get_messages_by_id failed: {e}"
-                            ))
+                            AppError::Telegram(format!("telegram get_messages_by_id failed: {e}"))
                         })?;
-                    let message = messages
-                        .into_iter()
-                        .next()
-                        .flatten()
-                        .ok_or_else(|| AppError::Telegram("chunk message not found".to_string()))?;
+                    let message =
+                        messages.into_iter().next().flatten().ok_or_else(|| {
+                            AppError::Telegram("chunk message not found".to_string())
+                        })?;
                     let media = message.media().ok_or_else(|| {
                         AppError::Telegram("chunk message has no downloadable media".to_string())
                     })?;
@@ -336,8 +482,85 @@ impl TelegramClient {
                 }
             })
             .await;
+
         let _ = fs::remove_file(&temp_file).await;
         result
+    }
+
+    pub async fn download_file_to_path(
+        &self,
+        telegram_file_id: &str,
+        destination_path: &Path,
+    ) -> AppResult<()> {
+        self.ensure_auth()?;
+        if self.mock_mode {
+            let id = telegram_file_id.to_string();
+            let destination_path = destination_path.to_path_buf();
+            return self
+                .with_retry(|| async {
+                    let pattern = format!("{id}-");
+                    let mut entries = fs::read_dir(&self.store_dir).await?;
+                    while let Some(entry) = entries.next_entry().await? {
+                        let file_name = entry.file_name();
+                        if file_name.to_string_lossy().starts_with(&pattern) {
+                            if let Some(parent) = destination_path.parent() {
+                                fs::create_dir_all(parent).await?;
+                            }
+                            fs::copy(entry.path(), &destination_path).await?;
+                            return Ok(());
+                        }
+                    }
+                    Err(AppError::NotFound(format!(
+                        "mock telegram object not found: {id}"
+                    )))
+                })
+                .await;
+        }
+
+        let message_id: i32 = telegram_file_id.parse().map_err(|_| {
+            AppError::Validation(format!(
+                "invalid telegram_file_id (expected message id): {telegram_file_id}"
+            ))
+        })?;
+        let api_id = self
+            .auth_lock()?
+            .api_id
+            .ok_or_else(|| AppError::Telegram("missing api_id in auth context".to_string()))?;
+        let client = self.ensure_client(api_id).await?;
+        let peer = self.saved_messages_peer(&client).await?;
+        let destination_path = destination_path.to_path_buf();
+
+        self.with_retry(|| {
+            let client = client.clone();
+            let destination_path = destination_path.clone();
+            async move {
+                if let Some(parent) = destination_path.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                let messages = client
+                    .get_messages_by_id(peer, &[message_id])
+                    .await
+                    .map_err(|e| {
+                        AppError::Telegram(format!("telegram get_messages_by_id failed: {e}"))
+                    })?;
+                let message = messages
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| AppError::Telegram("file message not found".to_string()))?;
+                let media = message.media().ok_or_else(|| {
+                    AppError::Telegram("file message has no downloadable media".to_string())
+                })?;
+                client
+                    .download_media(&media, &destination_path)
+                    .await
+                    .map_err(|e| {
+                        AppError::Telegram(format!("telegram download_media failed: {e}"))
+                    })?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     pub async fn backup_metadata_snapshot(&self, encrypted_snapshot: &[u8]) -> AppResult<String> {
@@ -461,6 +684,23 @@ impl TelegramClient {
     }
 }
 
+fn sanitize_upload_name(original_name: &str) -> String {
+    let candidate = Path::new(original_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("chunk.bin");
+    candidate.to_string()
+}
+
+fn mask_phone(phone: &str) -> String {
+    if phone.len() <= 4 {
+        return phone.to_string();
+    }
+    let keep = &phone[phone.len().saturating_sub(4)..];
+    format!("***{}", keep)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +726,15 @@ mod tests {
 
         let state = tg.verify_password("password123".to_string()).await.unwrap();
         assert!(matches!(state, AuthState::LoggedIn));
+    }
+
+    #[test]
+    fn upload_name_preserves_file_name_or_falls_back() {
+        assert_eq!(sanitize_upload_name("movie.part1.bin"), "movie.part1.bin");
+        assert_eq!(
+            sanitize_upload_name("C:\\tmp\\movie.part1.bin"),
+            "movie.part1.bin"
+        );
+        assert_eq!(sanitize_upload_name(""), "chunk.bin");
     }
 }

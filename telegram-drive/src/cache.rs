@@ -60,15 +60,39 @@ impl LocalCdnCache {
             return Ok(None);
         }
         let bytes = fs::read(&path).await?;
-        self.index.insert(hash.to_string(), bytes.len() as u64).await;
+        self.index
+            .insert(hash.to_string(), bytes.len() as u64)
+            .await;
         Ok(Some(bytes))
     }
 
     pub async fn write_chunk(&self, hash: &str, bytes: &[u8]) -> AppResult<()> {
         let path = self.path_for_hash(hash);
         fs::write(path, bytes).await?;
-        self.index.insert(hash.to_string(), bytes.len() as u64).await;
+        self.index
+            .insert(hash.to_string(), bytes.len() as u64)
+            .await;
         self.evict_if_needed().await
+    }
+
+    pub async fn import_file(&self, hash: &str, source_path: &Path) -> AppResult<()> {
+        let path = self.path_for_hash(hash);
+        fs::copy(source_path, &path).await?;
+        let size = fs::metadata(&path).await?.len();
+        self.index.insert(hash.to_string(), size).await;
+        self.evict_if_needed().await
+    }
+
+    pub async fn copy_to(&self, hash: &str, destination_path: &Path) -> AppResult<bool> {
+        let path = self.path_for_hash(hash);
+        if fs::metadata(&path).await.is_err() {
+            return Ok(false);
+        }
+        if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::copy(path, destination_path).await?;
+        Ok(true)
     }
 
     async fn evict_if_needed(&self) -> AppResult<()> {
@@ -129,7 +153,9 @@ mod tests {
     #[tokio::test]
     async fn hash_mapping() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = LocalCdnCache::new(dir.path().join("cache"), 1024).await.unwrap();
+        let cache = LocalCdnCache::new(dir.path().join("cache"), 1024)
+            .await
+            .unwrap();
         let path = cache.path_for_hash("abc123");
         assert!(path.ends_with("abc123"));
     }

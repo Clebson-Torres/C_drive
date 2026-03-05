@@ -1,7 +1,10 @@
 use crate::database::Database;
-use crate::models::{AppError, AppResult, AuthState};
+use crate::models::{AppError, AppResult, AuthPrefillDto, AuthState, UserProfileDto};
 use crate::telegram::TelegramClient;
-use aes_gcm::{aead::{Aead, KeyInit, OsRng}, AeadCore, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, KeyInit, OsRng},
+    AeadCore, Aes256Gcm, Nonce,
+};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
@@ -26,8 +29,24 @@ impl AuthService {
         Ok(AuthState::LoggedOut)
     }
 
-    pub async fn start_phone_auth(&self, phone: String, api_id: i32, api_hash: String) -> AppResult<AuthState> {
-        let state = self.telegram.start_phone_auth(phone, api_id, api_hash).await?;
+    pub async fn start_phone_auth(
+        &self,
+        phone: String,
+        api_id: i32,
+        api_hash: String,
+    ) -> AppResult<AuthState> {
+        self.db.set_setting_json(
+            "auth.prefill",
+            &AuthPrefillDto {
+                phone: phone.clone(),
+                api_id,
+                api_hash: api_hash.clone(),
+            },
+        )?;
+        let state = self
+            .telegram
+            .start_phone_auth(phone, api_id, api_hash)
+            .await?;
         Ok(state)
     }
 
@@ -45,6 +64,20 @@ impl AuthService {
 
     pub fn status(&self) -> AuthState {
         self.telegram.auth_state()
+    }
+
+    pub async fn profile(&self) -> AppResult<UserProfileDto> {
+        self.telegram.profile().await
+    }
+
+    pub async fn logout(&self) -> AppResult<AuthState> {
+        self.telegram.logout().await?;
+        self.db.delete_session_blob("primary")?;
+        Ok(AuthState::LoggedOut)
+    }
+
+    pub fn prefill(&self) -> AppResult<Option<AuthPrefillDto>> {
+        self.db.get_setting_json("auth.prefill")
     }
 
     async fn persist_session(&self) -> AppResult<()> {
@@ -123,5 +156,39 @@ mod tests {
         let auth2 = AuthService::new(db, tg2);
         let restored = auth2.restore_session().await.unwrap();
         assert!(matches!(restored, AuthState::LoggedIn));
+    }
+
+    #[tokio::test]
+    async fn logout_keeps_prefill_and_clears_session_restore() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let tg = TelegramClient::new_with_mode(temp.path().join("tg"), true)
+            .await
+            .unwrap();
+        let auth = AuthService::new(db.clone(), tg);
+
+        auth.start_phone_auth("+5511999999999".to_string(), 37673970, "hash".to_string())
+            .await
+            .unwrap();
+        auth.verify_code("12345".to_string()).await.unwrap();
+
+        let prefill = auth.prefill().unwrap().unwrap();
+        assert_eq!(prefill.phone, "+5511999999999");
+        assert_eq!(prefill.api_id, 37673970);
+
+        let logged_out = auth.logout().await.unwrap();
+        assert!(matches!(logged_out, AuthState::LoggedOut));
+
+        let tg2 = TelegramClient::new_with_mode(temp.path().join("tg2"), true)
+            .await
+            .unwrap();
+        let auth2 = AuthService::new(db, tg2);
+        let restored = auth2.restore_session().await.unwrap();
+        assert!(matches!(restored, AuthState::LoggedOut));
+
+        let prefill_after = auth2.prefill().unwrap().unwrap();
+        assert_eq!(prefill_after.phone, "+5511999999999");
+        assert_eq!(prefill_after.api_hash, "hash");
     }
 }

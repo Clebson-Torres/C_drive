@@ -11,7 +11,12 @@ impl FileIndexService {
         Self { db }
     }
 
-    pub fn list_folder(&self, folder_id: i64, page: u32, page_size: u32) -> AppResult<FolderListResponse> {
+    pub fn list_folder(
+        &self,
+        folder_id: i64,
+        page: u32,
+        page_size: u32,
+    ) -> AppResult<FolderListResponse> {
         self.db.list_folder(folder_id, page, page_size)
     }
 

@@ -182,9 +182,9 @@ fn load_state_or_default(path: &Path, key: &[u8; 32]) -> PersistedState {
         Err(_) => return PersistedState::default(),
     };
 
-    match decrypt_blob(key, &bytes)
-        .and_then(|plain| serde_json::from_slice::<PersistedState>(&plain).map_err(|e| e.to_string()))
-    {
+    match decrypt_blob(key, &bytes).and_then(|plain| {
+        serde_json::from_slice::<PersistedState>(&plain).map_err(|e| e.to_string())
+    }) {
         Ok(state) => state,
         Err(e) => {
             warn!(error = %e, path = %path.display(), "corrupted telegram session snapshot; backing up and resetting");
@@ -198,7 +198,11 @@ fn load_state_or_default(path: &Path, key: &[u8; 32]) -> PersistedState {
     }
 }
 
-async fn save_snapshot(path: &Path, key: &[u8; 32], snapshot: &PersistedState) -> Result<(), String> {
+async fn save_snapshot(
+    path: &Path,
+    key: &[u8; 32],
+    snapshot: &PersistedState,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
