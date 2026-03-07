@@ -5,7 +5,11 @@ test.beforeEach(async ({ page }) => {
     let authState = "LoggedOut";
     const folders = [{ id: 1, name: "Root", parent_id: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }];
     const calls: Array<{ cmd: string; args: any }> = [];
+    const listeners = new Map<string, Array<(event: any) => void>>();
     (window as any).__TEST_CALLS__ = calls;
+    (window as any).__emitTauriEvent = (name: string, payload: any) => {
+      for (const cb of listeners.get(name) || []) cb({ payload });
+    };
 
     const ok = (data: any) => ({ ok: true, data, error: null });
     const err = (message: string) => ({ ok: false, data: null, error: message });
@@ -20,7 +24,7 @@ test.beforeEach(async ({ page }) => {
             case "auth_prefill":
               return ok({ phone: "+551100000000", api_id: 37673970, api_hash: "hash" });
             case "auth_start":
-              if (!args?.input?.phone || !args?.input?.api_id || !args?.input?.api_hash) {
+              if (!args?.input?.phone) {
                 return err("invalid auth input");
               }
               authState = "AwaitingCode";
@@ -54,7 +58,24 @@ test.beforeEach(async ({ page }) => {
             case "folder_tree":
               return ok(folders);
             case "list_folder":
-              return ok({ folders: [], files: [], total_folders: 0, total_files: 0 });
+              return ok({
+                folders: [],
+                files: [{
+                  id: 88,
+                  name: "archive.bin",
+                  size: 3 * 1024 * 1024 * 1024,
+                  hash: "abc123",
+                  folder_id: 1,
+                  mime_type: "application/octet-stream",
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                  original_path: null,
+                  storage_mode: "Chunked",
+                  telegram_file_id: null,
+                }],
+                total_folders: 0,
+                total_files: 1,
+              });
             case "search":
               return ok({ folders: [], files: [], total_folders: 0, total_files: 0 });
             case "create_folder":
@@ -93,10 +114,29 @@ test.beforeEach(async ({ page }) => {
               return ok([501, 502, 503]);
             case "preview_image":
               return ok({ local_path: "C:/tmp/preview.png", mime_type: "image/png" });
+            case "download_file":
+              return ok({
+                cache_state: args?.cacheMode === "enabled" ? "Pending" : "Skipped",
+                cache_mode: args?.cacheMode === "enabled" ? "Enabled" : "Disabled",
+                message: args?.cacheMode === "enabled"
+                  ? "Download concluído. Cache preenchendo em background."
+                  : "Download concluído sem preencher cache.",
+              });
             case "transfer_cancel":
               return ok(null);
+            case "transfer_pause":
+              return ok(null);
+            case "transfer_resume":
+              return ok(null);
             case "settings_get":
-              return ok({ chunk_size_bytes: 33554432, max_parallelism: 16, encrypt_chunks: true });
+              return ok({
+                chunk_size_bytes: 134217728,
+                max_parallelism: 16,
+                encrypt_chunks: true,
+                download_cache_default_mode: "Threshold",
+                download_cache_threshold_bytes: 2147483648,
+                download_cache_write_mode: "Background",
+              });
             case "settings_set":
               return ok(null);
             default:
@@ -105,7 +145,17 @@ test.beforeEach(async ({ page }) => {
         },
       },
       event: {
-        listen: async () => () => {},
+        listen: async (name: string, cb: (event: any) => void) => {
+          const existing = listeners.get(name) || [];
+          existing.push(cb);
+          listeners.set(name, existing);
+          return () => {
+            listeners.set(
+              name,
+              (listeners.get(name) || []).filter((item) => item !== cb)
+            );
+          };
+        },
       },
     };
   });
@@ -115,24 +165,21 @@ test.beforeEach(async ({ page }) => {
 
 async function login(page: any) {
   await page.fill("#inputPhone", "+551100000000");
-  await page.fill("#inputApiId", "37673970");
-  await page.fill("#inputApiHash", "hash");
   await page.click("#btnAuthStart");
   await page.fill("#inputCode", "12345");
   await page.click("#btnAuthCode");
   await expect(page.locator("#driveShell")).toBeVisible();
 }
 
-test("renders login screen and no QR button", async ({ page }) => {
+test("renders simplified login screen without QR or API fields", async ({ page }) => {
   await expect(page.locator("#authScreen")).toBeVisible();
   await expect(page.locator("#btnQr")).toHaveCount(0);
-  await expect(page.locator("#btnApiHelp")).toBeVisible();
+  await expect(page.locator("#inputApiId")).toHaveCount(0);
+  await expect(page.locator("#inputApiHash")).toHaveCount(0);
 });
 
 test("full login with code unlocks drive", async ({ page }) => {
   await page.fill("#inputPhone", "+551100000000");
-  await page.fill("#inputApiId", "37673970");
-  await page.fill("#inputApiHash", "hash");
   await page.click("#btnAuthStart");
   await expect(page.locator("#authFormCode")).toBeVisible();
   await page.fill("#inputCode", "12345");
@@ -144,8 +191,6 @@ test("full login with code unlocks drive", async ({ page }) => {
 
 test("2fa path requires password", async ({ page }) => {
   await page.fill("#inputPhone", "+551100000000");
-  await page.fill("#inputApiId", "37673970");
-  await page.fill("#inputApiHash", "hash");
   await page.click("#btnAuthStart");
 
   await page.fill("#inputCode", "00000");
@@ -219,8 +264,8 @@ test("settings modal lets user choose chunk size profile", async ({ page }) => {
   await page.click("#btnUserMenu");
   await page.click("#btnOpenSettings");
   await expect(page.locator("#settingsModal")).toBeVisible();
-  await page.selectOption("#settingsChunkSize", "67108864");
-  await expect(page.locator("#settingsChunkSummary")).toContainText("64 MiB");
+  await page.selectOption("#settingsChunkSize", "268435456");
+  await expect(page.locator("#settingsChunkSummary")).toContainText("256 MiB");
   await page.fill("#settingsParallelism", "24");
   await page.click("#btnSettingsSave");
 
@@ -230,14 +275,143 @@ test("settings modal lets user choose chunk size profile", async ({ page }) => {
   const settingsCall = calls.find((c: any) => c.cmd === "settings_set");
   expect(settingsCall).toBeTruthy();
   expect(settingsCall.args.settings).toMatchObject({
-    chunk_size_bytes: 67108864,
+    chunk_size_bytes: 268435456,
     max_parallelism: 24,
     encrypt_chunks: true,
+    download_cache_default_mode: "Threshold",
+    download_cache_threshold_bytes: 2147483648,
+    download_cache_write_mode: "Background",
   });
 });
 
-test("api help modal shows official link", async ({ page }) => {
-  await page.click("#btnApiHelp");
-  await expect(page.locator("#apiHelpModal")).toBeVisible();
-  await expect(page.locator("#apiHelpLink")).toHaveAttribute("href", "https://my.telegram.org/apps");
+test("download modal lets user override cache policy", async ({ page }) => {
+  await login(page);
+  await page.click(".dl-btn");
+  await expect(page.locator("#downloadModal")).toBeVisible();
+  await expect(page.locator("#downloadCacheSummary")).toContainText("acima de 2.00 GB");
+  await page.selectOption("#downloadCacheMode", "enabled");
+  await page.click("#btnDownloadConfirm");
+  await expect(page.locator("#driveMessage")).toContainText("Cache preenchendo em background");
+
+  const calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
+  const downloadCall = calls.find((c: any) => c.cmd === "download_file");
+  expect(downloadCall).toBeTruthy();
+  expect(downloadCall.args).toMatchObject({
+    fileId: 88,
+    file_id: 88,
+    cacheMode: "enabled",
+    cache_mode: "enabled",
+  });
+});
+
+test("queue shows transfer direction labels", async ({ page }) => {
+  await login(page);
+  await page.evaluate(() => {
+    const event = new CustomEvent("__inject_transfer__", {
+      detail: {
+        upload: {
+          job_id: "upload-1",
+          file_name: "archive.bin",
+          state: "Running",
+          phase: "Uploading",
+          storage_mode: "Chunked",
+          bytes_done: 1024,
+          bytes_total: 2048,
+          error: null,
+          speed_bps: 100,
+          eta_seconds: 30,
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+        download: {
+          job_id: "download-1",
+          file_name: "image.png",
+          state: "Completed",
+          phase: "Completed",
+          storage_mode: "Single",
+          bytes_done: 2048,
+          bytes_total: 2048,
+          error: null,
+          speed_bps: 0,
+          eta_seconds: null,
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      },
+    });
+    window.dispatchEvent(event);
+  });
+  await expect(page.locator("#progressList")).toContainText("Upload");
+  await expect(page.locator("#progressList")).toContainText("Download");
+});
+
+test("queue supports pause and continue actions", async ({ page }) => {
+  await login(page);
+  await page.evaluate(() => {
+    window.dispatchEvent(new CustomEvent("__inject_transfer__", {
+      detail: {
+        upload: {
+          job_id: "upload-77",
+          file_name: "huge.iso",
+          state: "Running",
+          phase: "Uploading",
+          storage_mode: "Chunked",
+          bytes_done: 1024,
+          bytes_total: 4096,
+          error: null,
+          speed_bps: 100,
+          eta_seconds: 30,
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      },
+    }));
+  });
+
+  await page.getByRole("button", { name: "Pausar" }).click();
+  let calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
+  expect(calls.some((c: any) => c.cmd === "transfer_pause")).toBeTruthy();
+
+  await page.evaluate(() => {
+    (window as any).__emitTauriEvent("transfer_state_changed", {
+      job_id: "upload-77",
+      file_name: "huge.iso",
+      state: "Paused",
+      phase: "Uploading",
+      storage_mode: "Chunked",
+      bytes_done: 1024,
+      bytes_total: 4096,
+      error: null,
+      speed_bps: 0,
+      eta_seconds: null,
+      started_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  });
+
+  await expect(page.locator("#progressList")).toContainText("Pausado");
+  await page.getByRole("button", { name: "Continuar" }).click();
+  calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
+  expect(calls.some((c: any) => c.cmd === "transfer_resume")).toBeTruthy();
+});
+
+test("selection details update when choosing a file", async ({ page }) => {
+  await login(page);
+  await page.locator("#fileRows tr").first().click();
+  await expect(page.locator("#selectionDetails")).toContainText("archive.bin");
+  await expect(page.locator("#selectionDetails")).toContainText("chunked");
+});
+
+test("native drag-drop uploads paths emitted by tauri", async ({ page }) => {
+  await login(page);
+  await page.evaluate(() => {
+    (window as any).__emitTauriEvent("tauri://drag-drop", {
+      paths: ["C:/tmp/dropped.iso"],
+    });
+  });
+
+  await expect(page.locator("#driveMessage")).toContainText("Upload iniciado para 1 arquivo");
+  const calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
+  const uploadCall = calls.find((c: any) => c.cmd === "upload_files" && c.args.paths?.includes("C:/tmp/dropped.iso"));
+  expect(uploadCall).toBeTruthy();
 });

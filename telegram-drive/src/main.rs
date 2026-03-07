@@ -8,6 +8,7 @@ mod dedup;
 mod downloader;
 mod file_index;
 mod models;
+mod performance;
 mod progress;
 mod session_store;
 mod telegram;
@@ -23,9 +24,10 @@ use dedup::DedupEngine;
 use downloader::DownloadService;
 use file_index::FileIndexService;
 use models::{
-    ApiResponse, AuthPrefillDto, AuthStartInput, AuthState, EntryKind, MoveInput, RenameInput,
-    SearchQuery, SettingsDto,
+    ApiResponse, AuthPrefillDto, AuthStartInput, AuthState, DownloadCacheMode, DownloadResponse,
+    EntryKind, MoveInput, RenameInput, SearchQuery, SettingsDto,
 };
+use performance::AppPerformanceController;
 use progress::ProgressHub;
 use sha2::Digest;
 use std::path::PathBuf;
@@ -312,11 +314,14 @@ async fn pick_folder_native() -> Result<ApiResponse<Option<String>>, String> {
 
 #[tauri::command]
 async fn download_file(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     file_id: i64,
     destination_path: String,
-) -> Result<ApiResponse<()>, String> {
+    cache_mode: Option<String>,
+) -> Result<ApiResponse<DownloadResponse>, String> {
     let settings = state.db.load_settings().unwrap_or_default();
+    let requested_cache_mode = DownloadCacheMode::from_option_str(cache_mode.as_deref());
     Ok(map_response(
         state
             .downloader
@@ -324,6 +329,9 @@ async fn download_file(
                 file_id,
                 PathBuf::from(destination_path),
                 settings.max_parallelism,
+                settings,
+                requested_cache_mode,
+                Some(app),
             )
             .await,
     ))
@@ -347,6 +355,24 @@ async fn transfer_cancel(
     job_id: String,
 ) -> Result<ApiResponse<()>, String> {
     state.progress.cancel(&job_id);
+    Ok(ApiResponse::ok(()))
+}
+
+#[tauri::command]
+async fn transfer_pause(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<ApiResponse<()>, String> {
+    state.progress.pause(&job_id);
+    Ok(ApiResponse::ok(()))
+}
+
+#[tauri::command]
+async fn transfer_resume(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<ApiResponse<()>, String> {
+    state.progress.resume(&job_id);
     Ok(ApiResponse::ok(()))
 }
 
@@ -442,6 +468,7 @@ async fn main() {
 
     let settings = db.load_settings().unwrap_or_default();
     let progress = ProgressHub::new();
+    let performance = AppPerformanceController::new();
 
     let cache = match LocalCdnCache::new(data_root.join("cache"), 6 * 1024 * 1024 * 1024).await {
         Ok(c) => c,
@@ -496,6 +523,7 @@ async fn main() {
         progress: progress.clone(),
     };
     let state_for_events = Arc::new(shared_state.clone());
+    let performance_for_events = performance.clone();
 
     let app = tauri::Builder::default()
         .manage(shared_state)
@@ -522,6 +550,8 @@ async fn main() {
             download_file,
             preview_image,
             transfer_cancel,
+            transfer_pause,
+            transfer_resume,
             transfers_snapshot,
             settings_get,
             settings_set,
@@ -529,6 +559,7 @@ async fn main() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
             let mut rx = state_for_events.progress.subscribe();
+            let progress_for_perf = state_for_events.progress.clone();
 
             // Emite eventos de progresso para o frontend em tempo real.
             // O canal tem capacidade 8192 para não perder eventos durante pico de chunks paralelos.
@@ -544,6 +575,18 @@ async fn main() {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
+                }
+            });
+
+            tauri::async_runtime::spawn(async move {
+                let mut last_active = None;
+                loop {
+                    let active = progress_for_perf.has_active_transfers();
+                    if last_active != Some(active) {
+                        performance_for_events.set_transfer_mode(active);
+                        last_active = Some(active);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             });
 

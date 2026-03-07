@@ -2,7 +2,8 @@ use crate::cache::LocalCdnCache;
 use crate::chunking::ChunkingEngine;
 use crate::database::Database;
 use crate::models::{
-    AppError, AppResult, PreviewResponse, StorageMode, TransferPhase, TransferState,
+    AppError, AppResult, CachePersistenceState, DownloadCacheEvent, DownloadCacheMode,
+    DownloadResponse, PreviewResponse, SettingsDto, StorageMode, TransferPhase, TransferState,
 };
 use crate::progress::ProgressHub;
 use crate::telegram::TelegramClient;
@@ -11,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tauri::{AppHandle, Emitter};
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
@@ -48,10 +50,15 @@ impl DownloadService {
         file_id: i64,
         destination_path: PathBuf,
         max_parallelism: usize,
-    ) -> AppResult<()> {
+        settings: SettingsDto,
+        requested_cache_mode: DownloadCacheMode,
+        app_handle: Option<AppHandle>,
+    ) -> AppResult<DownloadResponse> {
         let file = self.db.get_file(file_id)?;
-        let job_id = Uuid::new_v4().to_string();
+        let job_id = format!("download-{}", Uuid::new_v4());
         let total = file.size.max(0) as u64;
+        let effective_cache_mode =
+            settings.resolve_download_cache_mode(total, requested_cache_mode);
 
         self.progress.transition(
             &job_id,
@@ -69,6 +76,7 @@ impl DownloadService {
             job_id = %job_id,
             file_id,
             storage_mode = ?file.storage_mode,
+            cache_mode = ?effective_cache_mode,
             bytes_total = total
         );
 
@@ -82,6 +90,8 @@ impl DownloadService {
                         file.telegram_file_id,
                         destination_path,
                         total,
+                        effective_cache_mode,
+                        app_handle,
                     )
                     .await
                 }
@@ -93,6 +103,8 @@ impl DownloadService {
                         destination_path,
                         total,
                         max_parallelism,
+                        effective_cache_mode,
+                        app_handle,
                     )
                     .await
                 }
@@ -110,7 +122,9 @@ impl DownloadService {
         telegram_file_id: Option<String>,
         destination_path: PathBuf,
         total: u64,
-    ) -> AppResult<()> {
+        cache_mode: DownloadCacheMode,
+        app_handle: Option<AppHandle>,
+    ) -> AppResult<DownloadResponse> {
         if self.cache.copy_to(file_hash, &destination_path).await? {
             self.progress.transition(
                 job_id,
@@ -122,13 +136,31 @@ impl DownloadService {
                 total,
                 None,
             );
-            return Ok(());
+            return Ok(DownloadResponse {
+                cache_state: CachePersistenceState::Completed,
+                cache_mode,
+                message: Some("Download concluído com cache local.".to_string()),
+            });
         }
 
         let telegram_file_id = telegram_file_id.ok_or_else(|| {
             AppError::Validation("single-object file missing telegram_file_id".to_string())
         })?;
         let temp_path = destination_path.with_extension("download.tmp");
+        self.progress.wait_if_paused(job_id).await;
+        if self.progress.is_cancelled(job_id) {
+            self.progress.transition(
+                job_id,
+                file_name,
+                TransferState::Cancelled,
+                TransferPhase::Cancelled,
+                Some(StorageMode::Single),
+                0,
+                total,
+                None,
+            );
+            return Err(AppError::Validation("download cancelled".to_string()));
+        }
 
         self.telegram
             .download_file_to_path(&telegram_file_id, &temp_path)
@@ -170,11 +202,62 @@ impl DownloadService {
             return Err(err);
         }
 
-        self.cache.import_file(file_hash, &temp_path).await?;
         if let Some(parent) = destination_path.parent() {
             fs::create_dir_all(parent).await?;
         }
         fs::rename(&temp_path, &destination_path).await?;
+
+        let response = match cache_mode {
+            DownloadCacheMode::Enabled => {
+                let cache = self.cache.clone();
+                let file_name_owned = file_name.to_string();
+                let source_path = destination_path.clone();
+                let hash = file_hash.to_string();
+                emit_cache_event(
+                    &app_handle,
+                    &file_name_owned,
+                    CachePersistenceState::Pending,
+                    Some("Cache agendado em background.".to_string()),
+                );
+                tokio::spawn(async move {
+                    emit_cache_event(
+                        &app_handle,
+                        &file_name_owned,
+                        CachePersistenceState::Writing,
+                        Some("Persistindo cache em background.".to_string()),
+                    );
+                    match cache.import_file(&hash, &source_path).await {
+                        Ok(()) => emit_cache_event(
+                            &app_handle,
+                            &file_name_owned,
+                            CachePersistenceState::Completed,
+                            Some("Cache concluído.".to_string()),
+                        ),
+                        Err(e) => {
+                            error!(file = %file_name_owned, error = %e, "single-file cache write failed");
+                            emit_cache_event(
+                                &app_handle,
+                                &file_name_owned,
+                                CachePersistenceState::Failed,
+                                Some(format!("Falha ao persistir cache: {e}")),
+                            );
+                        }
+                    }
+                });
+                DownloadResponse {
+                    cache_state: CachePersistenceState::Pending,
+                    cache_mode,
+                    message: Some(
+                        "Download concluído. Cache preenchendo em background.".to_string(),
+                    ),
+                }
+            }
+            DownloadCacheMode::Disabled | DownloadCacheMode::Default => DownloadResponse {
+                cache_state: CachePersistenceState::Skipped,
+                cache_mode,
+                message: Some("Download concluído sem preencher cache.".to_string()),
+            },
+        };
 
         self.progress.transition(
             job_id,
@@ -186,7 +269,7 @@ impl DownloadService {
             total,
             None,
         );
-        Ok(())
+        Ok(response)
     }
 
     async fn download_chunked_file(
@@ -197,12 +280,32 @@ impl DownloadService {
         destination_path: PathBuf,
         total: u64,
         max_parallelism: usize,
-    ) -> AppResult<()> {
+        cache_mode: DownloadCacheMode,
+        app_handle: Option<AppHandle>,
+    ) -> AppResult<DownloadResponse> {
         let chunks = self.db.get_chunks_for_file(file_id)?;
         let semaphore = Arc::new(Semaphore::new(compute_parallelism(max_parallelism)));
         let mut futures = FuturesUnordered::new();
+        let cache_write_semaphore = Arc::new(Semaphore::new(1));
+        let mut cache_tasks = Vec::new();
+        let mut cache_scheduled = false;
+        let mut done = 0u64;
 
         for (part_index, hash, telegram_file_id, _size, nonce_b64) in chunks {
+            self.progress.wait_if_paused(job_id).await;
+            if self.progress.is_cancelled(job_id) {
+                self.progress.transition(
+                    job_id,
+                    file_name,
+                    TransferState::Cancelled,
+                    TransferPhase::Cancelled,
+                    Some(StorageMode::Chunked),
+                    done,
+                    total,
+                    None,
+                );
+                return Err(AppError::Validation("download cancelled".to_string()));
+            }
             let cache = self.cache.clone();
             let tg = self.telegram.clone();
             let permit = semaphore
@@ -213,22 +316,34 @@ impl DownloadService {
             futures.push(tokio::spawn(async move {
                 let _permit = permit;
                 if let Some(bytes) = cache.read_chunk(&hash).await? {
-                    return Ok::<(i64, String, String, Vec<u8>), AppError>((
-                        part_index, hash, nonce_b64, bytes,
+                    return Ok::<(i64, String, String, Vec<u8>, bool), AppError>((
+                        part_index, hash, nonce_b64, bytes, true,
                     ));
                 }
                 let bytes = tg.download_chunk(&telegram_file_id).await?;
-                cache.write_chunk(&hash, &bytes).await?;
-                Ok((part_index, hash, nonce_b64, bytes))
+                Ok((part_index, hash, nonce_b64, bytes, false))
             }));
         }
 
         let mut ordered = BTreeMap::<i64, Vec<u8>>::new();
-        let mut done = 0u64;
 
         while let Some(next) = futures.next().await {
+            self.progress.wait_if_paused(job_id).await;
+            if self.progress.is_cancelled(job_id) {
+                self.progress.transition(
+                    job_id,
+                    file_name,
+                    TransferState::Cancelled,
+                    TransferPhase::Cancelled,
+                    Some(StorageMode::Chunked),
+                    done,
+                    total,
+                    None,
+                );
+                return Err(AppError::Validation("download cancelled".to_string()));
+            }
             match next {
-                Ok(Ok((part_index, hash, nonce_b64, encrypted))) => {
+                Ok(Ok((part_index, hash, nonce_b64, encrypted, from_cache))) => {
                     let decrypted = self.chunking.decrypt_chunk(&nonce_b64, &encrypted)?;
                     let mut hasher = Sha256::new();
                     hasher.update(&decrypted);
@@ -252,6 +367,26 @@ impl DownloadService {
                     }
                     done += decrypted.len() as u64;
                     ordered.insert(part_index, decrypted);
+                    if cache_mode == DownloadCacheMode::Enabled && !from_cache {
+                        if !cache_scheduled {
+                            cache_scheduled = true;
+                            emit_cache_event(
+                                &app_handle,
+                                file_name,
+                                CachePersistenceState::Pending,
+                                Some("Cache agendado em background.".to_string()),
+                            );
+                        }
+                        let cache = self.cache.clone();
+                        let hash_for_cache = hash.clone();
+                        let writer_gate = cache_write_semaphore.clone();
+                        cache_tasks.push(tokio::spawn(async move {
+                            let _writer = writer_gate.acquire_owned().await.map_err(|_| {
+                                AppError::Concurrency("cache writer semaphore closed".to_string())
+                            })?;
+                            cache.write_chunk(&hash_for_cache, &encrypted).await
+                        }));
+                    }
                     self.progress.transition(
                         job_id,
                         file_name,
@@ -312,6 +447,67 @@ impl DownloadService {
         write_reassembled_file(&partial, &ordered).await?;
         fs::rename(&partial, &destination_path).await?;
 
+        let response = if cache_scheduled {
+            let file_name_owned = file_name.to_string();
+            tokio::spawn(async move {
+                emit_cache_event(
+                    &app_handle,
+                    &file_name_owned,
+                    CachePersistenceState::Writing,
+                    Some("Persistindo cache em background.".to_string()),
+                );
+                let mut cache_failed = None;
+                for task in cache_tasks {
+                    match task.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            cache_failed = Some(format!("Falha ao persistir cache: {e}"));
+                            break;
+                        }
+                        Err(join_err) => {
+                            cache_failed =
+                                Some(format!("Falha ao aguardar cache em background: {join_err}"));
+                            break;
+                        }
+                    }
+                }
+                match cache_failed {
+                    Some(message) => {
+                        error!(file = %file_name_owned, %message, "chunked cache write failed");
+                        emit_cache_event(
+                            &app_handle,
+                            &file_name_owned,
+                            CachePersistenceState::Failed,
+                            Some(message),
+                        );
+                    }
+                    None => emit_cache_event(
+                        &app_handle,
+                        &file_name_owned,
+                        CachePersistenceState::Completed,
+                        Some("Cache concluído.".to_string()),
+                    ),
+                }
+            });
+            DownloadResponse {
+                cache_state: CachePersistenceState::Pending,
+                cache_mode,
+                message: Some("Download concluído. Cache preenchendo em background.".to_string()),
+            }
+        } else if cache_mode == DownloadCacheMode::Enabled {
+            DownloadResponse {
+                cache_state: CachePersistenceState::Completed,
+                cache_mode,
+                message: Some("Download concluído com cache local.".to_string()),
+            }
+        } else {
+            DownloadResponse {
+                cache_state: CachePersistenceState::Skipped,
+                cache_mode,
+                message: Some("Download concluído sem preencher cache.".to_string()),
+            }
+        };
+
         self.progress.transition(
             job_id,
             file_name,
@@ -322,7 +518,7 @@ impl DownloadService {
             total,
             None,
         );
-        Ok(())
+        Ok(response)
     }
 
     pub async fn materialize_preview(&self, file_id: i64) -> AppResult<PreviewResponse> {
@@ -338,12 +534,37 @@ impl DownloadService {
             .and_then(|s| s.to_str())
             .unwrap_or("bin");
         let temp = std::env::temp_dir().join(format!("telegram-drive-preview-{}.{}", file.id, ext));
-        self.download_file(file_id, temp.clone(), 4).await?;
+        let _ = self
+            .download_file(
+                file_id,
+                temp.clone(),
+                4,
+                SettingsDto::default(),
+                DownloadCacheMode::Disabled,
+                None,
+            )
+            .await?;
 
         Ok(PreviewResponse {
             local_path: temp.to_string_lossy().to_string(),
             mime_type: file.mime_type,
         })
+    }
+}
+
+fn emit_cache_event(
+    app_handle: &Option<AppHandle>,
+    file_name: &str,
+    state: CachePersistenceState,
+    message: Option<String>,
+) {
+    if let Some(app) = app_handle {
+        let payload = DownloadCacheEvent {
+            file_name: file_name.to_string(),
+            state,
+            message,
+        };
+        let _ = app.emit("download_cache_state_changed", payload);
     }
 }
 

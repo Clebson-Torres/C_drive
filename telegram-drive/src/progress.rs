@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::broadcast;
+use tokio::time::{sleep, Duration};
 
 const COMPLETED_TTL_SECONDS: i64 = 300;
 
@@ -18,6 +19,7 @@ struct JobMeta {
 
 struct HubState {
     cancelled: HashSet<String>,
+    paused: HashSet<String>,
     last_status: HashMap<String, TransferStatus>,
     speed_samples: HashMap<String, SpeedSample>,
     job_meta: HashMap<String, JobMeta>,
@@ -36,6 +38,7 @@ impl ProgressHub {
             tx,
             state: Arc::new(Mutex::new(HubState {
                 cancelled: HashSet::new(),
+                paused: HashSet::new(),
                 last_status: HashMap::new(),
                 speed_samples: HashMap::new(),
                 job_meta: HashMap::new(),
@@ -69,9 +72,21 @@ impl ProgressHub {
             .unwrap_or_default()
     }
 
+    pub fn has_active_transfers(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| {
+                s.last_status.values().any(|status| {
+                    matches!(status.state, TransferState::Queued | TransferState::Running)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     pub fn cancel(&self, job_id: &str) {
         if let Ok(mut s) = self.state.lock() {
             s.cancelled.insert(job_id.to_string());
+            s.paused.remove(job_id);
         }
     }
 
@@ -80,6 +95,70 @@ impl ProgressHub {
             .lock()
             .map(|s| s.cancelled.contains(job_id))
             .unwrap_or(true)
+    }
+
+    pub fn pause(&self, job_id: &str) {
+        let snapshot = if let Ok(mut s) = self.state.lock() {
+            s.paused.insert(job_id.to_string());
+            if let Some(status) = s.last_status.get_mut(job_id) {
+                if !matches!(
+                    status.state,
+                    TransferState::Completed | TransferState::Failed | TransferState::Cancelled
+                ) {
+                    status.state = TransferState::Paused;
+                    status.speed_bps = 0;
+                    status.eta_seconds = None;
+                    status.updated_at = Utc::now();
+                    Some(status.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(status) = snapshot {
+            let _ = self.tx.send(status);
+        }
+    }
+
+    pub fn resume(&self, job_id: &str) {
+        let snapshot = if let Ok(mut s) = self.state.lock() {
+            s.paused.remove(job_id);
+            if let Some(status) = s.last_status.get_mut(job_id) {
+                if matches!(status.state, TransferState::Paused) {
+                    status.state = TransferState::Running;
+                    status.speed_bps = 0;
+                    status.eta_seconds = None;
+                    status.updated_at = Utc::now();
+                    Some(status.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(status) = snapshot {
+            let _ = self.tx.send(status);
+        }
+    }
+
+    pub fn is_paused(&self, job_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.paused.contains(job_id))
+            .unwrap_or(false)
+    }
+
+    pub async fn wait_if_paused(&self, job_id: &str) {
+        while self.is_paused(job_id) && !self.is_cancelled(job_id) {
+            sleep(Duration::from_millis(200)).await;
+        }
     }
 
     pub fn transition(
@@ -94,8 +173,16 @@ impl ProgressHub {
         err: Option<String>,
     ) {
         let now = Utc::now();
-        let (started_at, speed_bps) = self.compute_timing(job_id, done, now, &state);
-        let eta_seconds = if speed_bps > 0 && total > done {
+        let paused = self.is_paused(job_id);
+        let effective_state = if paused
+            && matches!(state, TransferState::Queued | TransferState::Running)
+        {
+            TransferState::Paused
+        } else {
+            state.clone()
+        };
+        let (started_at, speed_bps) = self.compute_timing(job_id, done, now, &effective_state);
+        let eta_seconds = if speed_bps > 0 && total > done && !matches!(effective_state, TransferState::Paused) {
             Some((total - done).div_ceil(speed_bps))
         } else {
             None
@@ -104,7 +191,7 @@ impl ProgressHub {
         let status = TransferStatus {
             job_id: job_id.to_string(),
             file_name: file_name.to_string(),
-            state: state.clone(),
+            state: effective_state.clone(),
             phase,
             storage_mode,
             bytes_done: done,
@@ -124,6 +211,7 @@ impl ProgressHub {
             ) {
                 s.speed_samples.remove(job_id);
                 s.cancelled.remove(job_id);
+                s.paused.remove(job_id);
             }
         }
         let _ = self.tx.send(status);
@@ -171,5 +259,41 @@ impl ProgressHub {
         };
 
         (started_at, speed_bps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::TransferPhase;
+
+    #[test]
+    fn detects_active_transfers() {
+        let hub = ProgressHub::new();
+        assert!(!hub.has_active_transfers());
+
+        hub.transition(
+            "job-1",
+            "file.bin",
+            TransferState::Running,
+            TransferPhase::Uploading,
+            None,
+            10,
+            100,
+            None,
+        );
+        assert!(hub.has_active_transfers());
+
+        hub.transition(
+            "job-1",
+            "file.bin",
+            TransferState::Completed,
+            TransferPhase::Completed,
+            None,
+            100,
+            100,
+            None,
+        );
+        assert!(!hub.has_active_transfers());
     }
 }

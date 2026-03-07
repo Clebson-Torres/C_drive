@@ -28,6 +28,10 @@ impl LocalCdnCache {
         self.cache_dir.join(hash)
     }
 
+    pub fn partial_path_for_hash(&self, hash: &str) -> PathBuf {
+        self.cache_dir.join(format!("{hash}.partial"))
+    }
+
     pub fn pin(&self, hash: &str) -> AppResult<()> {
         let mut guard = self
             .pinned
@@ -68,7 +72,12 @@ impl LocalCdnCache {
 
     pub async fn write_chunk(&self, hash: &str, bytes: &[u8]) -> AppResult<()> {
         let path = self.path_for_hash(hash);
-        fs::write(path, bytes).await?;
+        let partial = self.partial_path_for_hash(hash);
+        fs::write(&partial, bytes).await?;
+        if fs::metadata(&path).await.is_ok() {
+            let _ = fs::remove_file(&path).await;
+        }
+        fs::rename(&partial, &path).await?;
         self.index
             .insert(hash.to_string(), bytes.len() as u64)
             .await;
@@ -77,7 +86,12 @@ impl LocalCdnCache {
 
     pub async fn import_file(&self, hash: &str, source_path: &Path) -> AppResult<()> {
         let path = self.path_for_hash(hash);
-        fs::copy(source_path, &path).await?;
+        let partial = self.partial_path_for_hash(hash);
+        fs::copy(source_path, &partial).await?;
+        if fs::metadata(&path).await.is_ok() {
+            let _ = fs::remove_file(&path).await;
+        }
+        fs::rename(&partial, &path).await?;
         let size = fs::metadata(&path).await?.len();
         self.index.insert(hash.to_string(), size).await;
         self.evict_if_needed().await
@@ -158,5 +172,18 @@ mod tests {
             .unwrap();
         let path = cache.path_for_hash("abc123");
         assert!(path.ends_with("abc123"));
+    }
+
+    #[tokio::test]
+    async fn partial_files_are_not_treated_as_cache_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = LocalCdnCache::new(dir.path().join("cache"), 1024)
+            .await
+            .unwrap();
+        let partial = cache.partial_path_for_hash("abc123");
+        fs::write(&partial, b"incomplete").await.unwrap();
+
+        assert!(!cache.contains("abc123").await.unwrap());
+        assert!(cache.read_chunk("abc123").await.unwrap().is_none());
     }
 }

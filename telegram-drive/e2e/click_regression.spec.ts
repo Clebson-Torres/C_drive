@@ -59,7 +59,14 @@ test.beforeEach(async ({ page }) => {
               }
               return ok([10, 11]);
             case "settings_get":
-              return ok({ chunk_size_bytes: 33554432, max_parallelism: 16, encrypt_chunks: true });
+              return ok({
+                chunk_size_bytes: 134217728,
+                max_parallelism: 16,
+                encrypt_chunks: true,
+                download_cache_default_mode: "Threshold",
+                download_cache_threshold_bytes: 2147483648,
+                download_cache_write_mode: "Background",
+              });
             default:
               return ok(null);
           }
@@ -73,8 +80,6 @@ test.beforeEach(async ({ page }) => {
 
   await page.goto("/");
   await page.fill("#inputPhone", "+551100000000");
-  await page.fill("#inputApiId", "37673970");
-  await page.fill("#inputApiHash", "hash");
   await page.click("#btnAuthStart");
   await page.fill("#inputCode", "12345");
   await page.click("#btnAuthCode");

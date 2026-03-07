@@ -1,7 +1,8 @@
 # Rust / Cargo
 target/
 **/target/
-
+target-bench
+**/target-bench/
 # Tauri / desktop build outputs
 src-tauri/target/
 

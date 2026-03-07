@@ -1,11 +1,13 @@
 #![cfg(test)]
 
+use crate::auth::AuthService;
 use crate::cache::LocalCdnCache;
 use crate::chunking::ChunkingEngine;
 use crate::database::Database;
 use crate::dedup::DedupEngine;
 use crate::downloader::DownloadService;
 use crate::models::StorageMode;
+use crate::models::{DownloadCacheMode, SettingsDto};
 use crate::progress::ProgressHub;
 use crate::telegram::TelegramClient;
 use crate::uploader::{UploadService, SINGLE_UPLOAD_THRESHOLD_BYTES};
@@ -16,6 +18,8 @@ use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempfile::tempdir;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 
 #[derive(Clone)]
 struct TransferCase {
@@ -33,6 +37,26 @@ struct TransferLogRecord {
     download_ms: u128,
     chunk_count: usize,
     hash: String,
+}
+
+#[derive(Serialize)]
+struct ChunkBenchmarkRecord {
+    chunk_size_bytes: usize,
+    bytes: u64,
+    prep_ms: u128,
+    mib_per_sec: f64,
+    chunk_count: usize,
+}
+
+#[derive(Serialize)]
+struct RealUploadCompareRecord {
+    chunk_size_bytes: usize,
+    bytes: u64,
+    upload_ms: u128,
+    mib_per_sec: f64,
+    chunk_count: usize,
+    storage_mode: String,
+    file_name: String,
 }
 
 #[tokio::test]
@@ -111,7 +135,6 @@ async fn upload_download_matrix_real_files() {
         dedup.clone(),
         chunking.clone(),
         telegram.clone(),
-        cache.clone(),
         progress.clone(),
     );
     let downloader = DownloadService::new(
@@ -165,7 +188,14 @@ async fn upload_download_matrix_real_files() {
         let download_path = downloads_dir.join(case.name);
         let download_start = Instant::now();
         downloader
-            .download_file(file_id, download_path.clone(), 8)
+            .download_file(
+                file_id,
+                download_path.clone(),
+                8,
+                SettingsDto::default(),
+                DownloadCacheMode::Default,
+                None,
+            )
             .await
             .unwrap();
         let download_ms = download_start.elapsed().as_millis();
@@ -190,6 +220,203 @@ async fn upload_download_matrix_real_files() {
     write_summary(&summary_path, &records).unwrap();
 }
 
+#[tokio::test]
+#[ignore = "Manual large-file benchmark for chunk size comparison"]
+async fn benchmark_chunk_sizes_for_large_uploads() {
+    let fixture_bytes = benchmark_fixture_bytes();
+    let chunk_sizes = [
+        crate::models::CHUNK_SIZE_64_MIB,
+        crate::models::CHUNK_SIZE_128_MIB,
+        crate::models::CHUNK_SIZE_256_MIB,
+    ];
+
+    let log_dir = default_log_dir();
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let jsonl_path = log_dir.join("chunk-benchmark.jsonl");
+    let summary_path = log_dir.join("chunk-benchmark-summary.md");
+    let _ = std::fs::remove_file(&jsonl_path);
+    let _ = std::fs::remove_file(&summary_path);
+    let mut records = Vec::new();
+
+    for chunk_size in chunk_sizes {
+        let temp = tempdir().unwrap();
+        let mut key = [0u8; 32];
+        let digest = sha2::Sha256::digest(b"telegram-drive-benchmark-key");
+        key.copy_from_slice(&digest[..32]);
+
+        let chunking = ChunkingEngine::new(chunk_size, key);
+        let fixture = temp
+            .path()
+            .join(format!("benchmark-{}MiB.bin", chunk_size / 1024 / 1024));
+        create_sparse_file(&fixture, fixture_bytes).unwrap();
+
+        let prep_start = Instant::now();
+        let (total_bytes, chunk_count) = benchmark_chunk_preparation(&chunking, &fixture).await;
+        let prep_ms = prep_start.elapsed().as_millis();
+        let mib_per_sec =
+            total_bytes as f64 / 1024_f64 / 1024_f64 / (prep_ms.max(1) as f64 / 1000.0);
+
+        let record = ChunkBenchmarkRecord {
+            chunk_size_bytes: chunk_size,
+            bytes: total_bytes,
+            prep_ms,
+            mib_per_sec,
+            chunk_count,
+        };
+        append_json_line(&jsonl_path, &record).unwrap();
+        records.push(record);
+    }
+
+    write_chunk_benchmark_summary(&summary_path, &records).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "Manual real Telegram upload comparison; requires TGDRIVE_COMPARE_FILE and an authenticated local session"]
+async fn compare_real_upload_chunk_profiles() {
+    let source_path = std::env::var("TGDRIVE_COMPARE_FILE")
+        .map(PathBuf::from)
+        .expect("set TGDRIVE_COMPARE_FILE to the absolute file path for comparison");
+    let source_meta = std::fs::metadata(&source_path).expect("failed to stat TGDRIVE_COMPARE_FILE");
+    let data_root = dirs::data_dir()
+        .expect("data_dir unavailable")
+        .join("telegram-drive");
+    let real_db = Database::open(&data_root.join("telegram-drive.db"))
+        .expect("failed to open real telegram-drive.db");
+    let session_blob = real_db
+        .load_session_blob("primary")
+        .expect("failed to read stored session blob")
+        .expect("no stored session blob found");
+    let auth_prefill = real_db
+        .get_setting_json::<crate::models::AuthPrefillDto>("auth.prefill")
+        .expect("failed to read auth.prefill")
+        .expect("no auth.prefill found");
+
+    let temp = tempdir().unwrap();
+    let temp_db = Database::open(&temp.path().join("compare.db")).unwrap();
+    temp_db.save_session_blob("primary", &session_blob).unwrap();
+    temp_db
+        .set_setting_json("auth.prefill", &auth_prefill)
+        .unwrap();
+
+    let telegram = TelegramClient::new(data_root.join("telegram_saved_messages"))
+        .await
+        .expect("failed to build telegram client");
+    let auth = AuthService::new(temp_db.clone(), telegram.clone());
+    let restored = auth
+        .restore_session()
+        .await
+        .expect("session restore failed");
+    assert!(matches!(restored, crate::models::AuthState::LoggedIn));
+
+    let mut key = [0u8; 32];
+    let digest = sha2::Sha256::digest(
+        format!("telegram-drive-compare:{}", source_path.display()).as_bytes(),
+    );
+    key.copy_from_slice(&digest[..32]);
+
+    let progress = ProgressHub::new();
+    let log_dir = default_log_dir();
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let jsonl_path = log_dir.join("real-upload-compare.jsonl");
+    let summary_path = log_dir.join("real-upload-compare.md");
+    let _ = std::fs::remove_file(&jsonl_path);
+    let _ = std::fs::remove_file(&summary_path);
+
+    let chunk_sizes = [
+        crate::models::CHUNK_SIZE_128_MIB,
+        crate::models::CHUNK_SIZE_256_MIB,
+    ];
+    let mut records = Vec::new();
+
+    for chunk_size in chunk_sizes {
+        let db_for_run =
+            Database::open(&temp.path().join(format!("compare-{chunk_size}.db"))).unwrap();
+        db_for_run
+            .save_session_blob("primary", &session_blob)
+            .unwrap();
+        db_for_run
+            .set_setting_json("auth.prefill", &auth_prefill)
+            .unwrap();
+        let dedup = DedupEngine::new(db_for_run.clone());
+        let uploader = UploadService::new(
+            db_for_run.clone(),
+            dedup,
+            ChunkingEngine::new(chunk_size, key),
+            telegram.clone(),
+            progress.clone(),
+        );
+        let run_root_id = db_for_run.root_folder_id().unwrap();
+
+        let upload_start = Instant::now();
+        let file_id = uploader
+            .upload_file(run_root_id, source_path.clone(), 8, chunk_size)
+            .await
+            .expect("real upload comparison failed");
+        let upload_ms = upload_start.elapsed().as_millis();
+        let file = db_for_run.get_file(file_id).unwrap();
+        let chunk_count = db_for_run.get_chunks_for_file(file_id).unwrap().len();
+        let mib_per_sec =
+            source_meta.len() as f64 / 1024_f64 / 1024_f64 / (upload_ms.max(1) as f64 / 1000.0);
+
+        let record = RealUploadCompareRecord {
+            chunk_size_bytes: chunk_size,
+            bytes: source_meta.len(),
+            upload_ms,
+            mib_per_sec,
+            chunk_count,
+            storage_mode: format!("{:?}", file.storage_mode),
+            file_name: source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+        };
+        append_json_line(&jsonl_path, &record).unwrap();
+        records.push(record);
+    }
+
+    write_real_upload_compare_summary(&summary_path, &records).unwrap();
+}
+
+fn benchmark_fixture_bytes() -> u64 {
+    const DEFAULT_BYTES: u64 = 256 * 1024 * 1024;
+    std::env::var("TGDRIVE_BENCH_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|bytes| *bytes >= 64 * 1024 * 1024)
+        .unwrap_or(DEFAULT_BYTES)
+}
+
+async fn benchmark_chunk_preparation(chunking: &ChunkingEngine, path: &Path) -> (u64, usize) {
+    let mut file = File::open(path).await.unwrap();
+    let mut buffer = vec![0u8; chunking.chunk_size()];
+    let mut total_bytes = 0u64;
+    let mut filled = 0usize;
+    let mut chunk_count = 0usize;
+
+    loop {
+        let n = file.read(&mut buffer[filled..]).await.unwrap();
+        if n == 0 {
+            if filled == 0 {
+                break;
+            }
+        } else {
+            filled += n;
+            total_bytes += n as u64;
+        }
+
+        if filled < chunking.chunk_size() && n != 0 {
+            continue;
+        }
+
+        let _ = chunking.encrypt_chunk(&buffer[..filled]).unwrap();
+        chunk_count += 1;
+        filled = 0;
+    }
+
+    (total_bytes, chunk_count)
+}
+
 fn default_log_dir() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -197,7 +424,7 @@ fn default_log_dir() -> PathBuf {
         .join("perf")
 }
 
-fn append_json_line(path: &Path, record: &TransferLogRecord) -> std::io::Result<()> {
+fn append_json_line<T: Serialize>(path: &Path, record: &T) -> std::io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{}", serde_json::to_string(record).unwrap())?;
     Ok(())
@@ -221,6 +448,58 @@ fn write_summary(path: &Path, records: &[TransferLogRecord]) -> std::io::Result<
             record.upload_ms,
             record.download_ms,
             record.chunk_count
+        )?;
+    }
+    Ok(())
+}
+
+fn write_chunk_benchmark_summary(
+    path: &Path,
+    records: &[ChunkBenchmarkRecord],
+) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    writeln!(file, "# Chunk Benchmark Summary")?;
+    writeln!(file)?;
+    for record in records {
+        writeln!(
+            file,
+            "- chunk={} MiB | bytes={} | prep={}ms | throughput={:.2} MiB/s | chunks={}",
+            record.chunk_size_bytes / 1024 / 1024,
+            record.bytes,
+            record.prep_ms,
+            record.mib_per_sec,
+            record.chunk_count
+        )?;
+    }
+    Ok(())
+}
+
+fn write_real_upload_compare_summary(
+    path: &Path,
+    records: &[RealUploadCompareRecord],
+) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    writeln!(file, "# Real Upload Compare")?;
+    writeln!(file)?;
+    for record in records {
+        writeln!(
+            file,
+            "- file={} | chunk={} MiB | bytes={} | upload={}ms | throughput={:.2} MiB/s | chunks={} | mode={}",
+            record.file_name,
+            record.chunk_size_bytes / 1024 / 1024,
+            record.bytes,
+            record.upload_ms,
+            record.mib_per_sec,
+            record.chunk_count,
+            record.storage_mode
         )?;
     }
     Ok(())

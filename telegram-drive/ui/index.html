@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8" />
@@ -15,17 +15,12 @@
       <div class="auth-card">
         <span class="brand-pill">Telegram Drive</span>
         <h1>Seu storage pessoal sobre o Telegram.</h1>
-        <p class="auth-subtitle">Sessão persistente, cache local e deduplicação global no mesmo fluxo.</p>
+        <p class="auth-subtitle">Entre com telefone, código e 2FA. O app usa a configuração padrão interna de API.</p>
         <div id="authMessage" class="auth-message hidden"></div>
-        <button id="btnApiHelp" type="button" class="ghost-btn auth-help-btn">Como obter API ID / API Hash</button>
 
         <form id="authFormStart" class="auth-form">
           <label for="inputPhone">Telefone</label>
           <input id="inputPhone" type="text" placeholder="+55..." />
-          <label for="inputApiId">API ID</label>
-          <input id="inputApiId" type="number" placeholder="37673970" />
-          <label for="inputApiHash">API Hash</label>
-          <input id="inputApiHash" type="password" placeholder="6738..." />
           <button id="btnAuthStart" type="submit">Enviar código</button>
         </form>
 
@@ -46,22 +41,22 @@
     <div id="driveShell" class="drive-shell hidden">
       <div class="drive-bg-shape drive-bg-shape-1"></div>
       <div class="drive-bg-shape drive-bg-shape-2"></div>
+
       <header class="shell-header glass-panel">
-        <div class="shell-brand">
-          <span class="brand-pill">Telegram Drive</span>
-          <div>
-            <h2>Workspace</h2>
-            <p id="currentFolderLabel">Selecione uma pasta para navegar e sincronizar.</p>
-          </div>
-        </div>
-        <div class="shell-actions">
+        <div class="shell-actions shell-actions-left">
           <button id="btnUpload" class="primary-btn">Upload</button>
           <button id="btnUploadFolder" class="secondary-btn">Upload Folder</button>
           <button id="btnFolder" class="secondary-btn">New Folder</button>
+        </div>
+
+        <div class="shell-search">
           <label class="search-shell">
             <span>Search</span>
             <input id="searchInput" type="search" placeholder="Search files or folders" />
           </label>
+        </div>
+
+        <div class="shell-actions shell-actions-right">
           <div class="user-menu-shell">
             <button id="btnUserMenu" class="user-menu-trigger" type="button" aria-expanded="false">
               <span id="userAvatar" class="user-avatar">T</span>
@@ -89,46 +84,58 @@
 
       <div id="driveMessage" class="drive-message hidden"></div>
 
-      <section class="drive-stats">
-        <article class="glass-panel stat-card">
-          <span class="stat-label">Current Folder</span>
-          <strong id="statFolderName">Root</strong>
-        </article>
-        <article class="glass-panel stat-card">
-          <span class="stat-label">Entries Visible</span>
-          <strong id="statEntryCount">0</strong>
-        </article>
-        <article class="glass-panel stat-card">
-          <span class="stat-label">Transfers Active</span>
-          <strong id="statTransferCount">0</strong>
-        </article>
+      <section class="workspace-strip glass-panel">
+        <div class="workspace-strip-main">
+          <span class="brand-pill">Telegram Drive</span>
+          <h2 id="statFolderName">Root</h2>
+          <p id="currentFolderLabel">Selecione uma pasta para navegar e sincronizar.</p>
+        </div>
+        <div class="workspace-strip-stats">
+          <article class="strip-stat">
+            <span class="stat-label">Entries Visible</span>
+            <strong id="statEntryCount">0</strong>
+          </article>
+          <article class="strip-stat">
+            <span class="stat-label">Transfers Active</span>
+            <strong id="statTransferCount">0</strong>
+          </article>
+        </div>
       </section>
 
       <main class="drive-layout">
-        <aside class="glass-panel sidebar">
-          <div class="panel-heading">
-            <div>
-              <span class="eyebrow">Folder Tree</span>
-              <h3>Folders</h3>
-            </div>
-          </div>
-          <ul id="folderTree" class="folder-tree"></ul>
-        </aside>
-
         <section class="content-stack">
           <section class="glass-panel main-panel" id="dropZone">
             <div class="panel-heading">
               <div>
                 <span class="eyebrow">Explorer</span>
-                <h3>Files</h3>
+                <h3>Workspace</h3>
               </div>
-              <span class="drop-hint">Drag files here or use the native selectors.</span>
+              <span class="drop-hint">Arraste arquivos para upload ou use os seletores nativos.</span>
             </div>
 
             <div id="emptyState" class="empty-state hidden">
               <strong>No files yet</strong>
-              <p>Use Upload or Upload Folder to populate this workspace.</p>
+              <p>Use Upload ou Upload Folder para preencher este workspace.</p>
             </div>
+
+            <section class="explorer-shell">
+              <div class="folder-tiles-panel">
+                <div class="folder-tiles-header">
+                  <span class="eyebrow">Folders</span>
+                  <p>Navegação visual da pasta atual.</p>
+                </div>
+                <div id="folderTiles" class="folder-tiles"></div>
+              </div>
+
+              <div class="dropzone-card" id="dropzoneCard">
+                <div class="dropzone-illustration" aria-hidden="true">
+                  <span class="dropzone-folder folder-back"></span>
+                  <span class="dropzone-folder folder-front"></span>
+                </div>
+                <strong>Drop files to upload</strong>
+                <p>Arraste arquivos aqui para iniciar o envio imediato ou use os botões do topo.</p>
+              </div>
+            </section>
 
             <div class="table-shell">
               <table>
@@ -152,13 +159,34 @@
                 <span class="eyebrow">Transfer Queue</span>
                 <h3>Transfers</h3>
               </div>
-              <span class="panel-caption">Uploads e downloads com snapshot persistente.</span>
+              <span class="panel-caption">Uploads e downloads com início, ETA e conclusão.</span>
             </div>
             <div id="progressList" class="progress-list">
               <p class="empty-progress">Nenhuma transferência em andamento.</p>
             </div>
           </section>
         </section>
+
+        <aside class="glass-panel sidebar">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">Folder Tree</span>
+              <h3>Folders</h3>
+            </div>
+          </div>
+          <ul id="folderTree" class="folder-tree"></ul>
+          <section class="details-panel">
+            <div class="panel-heading details-heading">
+              <div>
+                <span class="eyebrow">Details</span>
+                <h3>Selection</h3>
+              </div>
+            </div>
+            <div id="selectionDetails" class="selection-details">
+              <p class="selection-empty">Selecione uma pasta ou arquivo para ver detalhes.</p>
+            </div>
+          </section>
+        </aside>
       </main>
     </div>
 
@@ -181,6 +209,25 @@
       </div>
     </div>
 
+    <div id="downloadModal" class="hidden modal">
+      <div class="modal-card modal-form-card">
+        <span class="eyebrow">Download</span>
+        <h3>Confirmar download</h3>
+        <p id="downloadTargetSummary" class="modal-copy"></p>
+        <label for="downloadCacheMode" class="settings-label">Cache local</label>
+        <select id="downloadCacheMode">
+          <option value="default">Usar padrão</option>
+          <option value="disabled">Baixar sem cache</option>
+          <option value="enabled">Baixar e armazenar no cache</option>
+        </select>
+        <p id="downloadCacheSummary" class="modal-copy"></p>
+        <div class="modal-actions">
+          <button id="btnDownloadCancel" class="ghost-btn" type="button">Cancelar</button>
+          <button id="btnDownloadConfirm" class="primary-btn" type="button">Baixar</button>
+        </div>
+      </div>
+    </div>
+
     <div id="settingsModal" class="hidden modal">
       <div class="modal-card modal-form-card settings-card">
         <div class="panel-heading">
@@ -193,12 +240,12 @@
           <div class="settings-block">
             <label for="settingsChunkSize" class="settings-label">Chunked uploads (&gt; 2 GiB)</label>
             <select id="settingsChunkSize">
-              <option value="8388608">8 MiB</option>
-              <option value="33554432">32 MiB</option>
               <option value="67108864">64 MiB</option>
+              <option value="134217728">128 MiB</option>
+              <option value="268435456">256 MiB</option>
             </select>
             <p>&le; 2 GiB continuam como arquivo único no Telegram.</p>
-            <p id="settingsChunkSummary">Acima de 2 GiB, o app usa chunks de 32 MiB.</p>
+            <p id="settingsChunkSummary">Entre 2 GiB e 20 GiB, o app usa chunks de 128 MiB. Acima disso, eleva para 256 MiB.</p>
           </div>
           <div class="settings-block">
             <label for="settingsParallelism" class="settings-label">Parallel uploads</label>
@@ -212,31 +259,13 @@
           </div>
           <div class="settings-block">
             <span class="settings-label">Cache</span>
-            <p>Disk cache enabled for downloaded chunks and single objects.</p>
+            <p id="settingsDownloadCacheSummary">Downloads acima de 2 GiB entram no cache automaticamente.</p>
+            <p id="settingsDownloadCacheWriteSummary">Persistência de cache ocorre em background.</p>
           </div>
         </div>
         <div class="modal-actions">
           <button id="btnSettingsClose" class="ghost-btn" type="button">Close</button>
           <button id="btnSettingsSave" class="primary-btn" type="button">Save</button>
-        </div>
-      </div>
-    </div>
-
-    <div id="apiHelpModal" class="hidden modal">
-      <div class="modal-card modal-form-card api-help-card">
-        <span class="eyebrow">API Access</span>
-        <h3>Como obter API ID e API Hash</h3>
-        <ol class="help-steps">
-          <li>Acesse <a id="apiHelpLink" href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">my.telegram.org/apps</a>.</li>
-          <li>Faça login com o mesmo número de telefone da sua conta Telegram.</li>
-          <li>Abra a seção <strong>API development tools</strong>.</li>
-          <li>Crie um app preenchendo nome, short name e plataforma.</li>
-          <li>Copie o <code>api_id</code> e o <code>api_hash</code> exibidos.</li>
-          <li>Volte ao Telegram Drive e preencha os campos de login.</li>
-        </ol>
-        <div class="modal-actions">
-          <button id="btnApiHelpClose" class="ghost-btn" type="button">Fechar</button>
-          <a class="primary-btn link-btn" href="https://my.telegram.org/apps" target="_blank" rel="noreferrer">Abrir página oficial</a>
         </div>
       </div>
     </div>
