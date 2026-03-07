@@ -2,11 +2,16 @@
   "name": "telegram-drive-e2e",
   "private": true,
   "scripts": {
+    "sync:version": "node ./scripts/sync-version.mjs",
+    "tauri": "tauri",
+    "build:desktop": "tauri build --ci --no-sign",
+    "build:desktop:ci": "tauri build --debug --no-bundle --ci --no-sign",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed"
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0",
+    "@tauri-apps/cli": "^2.9.1",
     "http-server": "^14.1.1"
   }
 }

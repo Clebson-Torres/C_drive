@@ -10,6 +10,7 @@ pub struct LocalCdnCache {
     cache_dir: PathBuf,
     index: Cache<String, u64>,
     max_bytes: u64,
+    #[allow(dead_code)]
     pinned: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -32,6 +33,7 @@ impl LocalCdnCache {
         self.cache_dir.join(format!("{hash}.partial"))
     }
 
+    #[allow(dead_code)]
     pub fn pin(&self, hash: &str) -> AppResult<()> {
         let mut guard = self
             .pinned
@@ -41,6 +43,7 @@ impl LocalCdnCache {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn unpin(&self, hash: &str) -> AppResult<()> {
         let mut guard = self
             .pinned
@@ -50,6 +53,7 @@ impl LocalCdnCache {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn contains(&self, hash: &str) -> AppResult<bool> {
         if self.index.get(hash).await.is_some() {
             return Ok(true);
@@ -155,6 +159,7 @@ impl LocalCdnCache {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }

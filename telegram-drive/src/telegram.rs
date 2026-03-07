@@ -24,6 +24,7 @@ const UPLOAD_POOL_SIZE: usize = 4;
 #[derive(Clone)]
 pub struct TelegramClient {
     store_dir: PathBuf,
+    #[allow(dead_code)]
     metadata_dir: PathBuf,
     session_path: PathBuf,
     mock_mode: bool,

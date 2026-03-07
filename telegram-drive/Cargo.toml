@@ -2,8 +2,8 @@
 name = "telegram-drive"
 version = "0.1.0"
 edition = "2021"
-description = "Telegram Drive desktop application"
-authors = ["Telegram Drive Team"]
+description = "Savedrive desktop application"
+authors = ["Savedrive Team"]
 license = "MIT"
 
 [package.metadata.tauri]

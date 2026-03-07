@@ -37,6 +37,7 @@ impl ChunkingEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
     }
@@ -45,6 +46,15 @@ impl ChunkingEngine {
         Self::new(chunk_size, self.encryption_key)
     }
 
+    #[cfg(test)]
+    pub fn encrypt_chunk(&self, chunk_plain: &[u8]) -> AppResult<Vec<u8>> {
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        self.cipher
+            .encrypt(&nonce, chunk_plain)
+            .map_err(|e| AppError::Crypto(format!("chunk encryption failed: {e}")))
+    }
+
+    #[allow(dead_code)]
     pub async fn hash_file(&self, path: &Path) -> AppResult<(String, u64)> {
         self.hash_file_with_progress(path, |_, _| Ok(())).await
     }
@@ -81,6 +91,7 @@ impl ChunkingEngine {
         Ok((hex::encode(file_hasher.finalize()), processed))
     }
 
+    #[allow(dead_code)]
     pub async fn split_and_encrypt_file(
         &self,
         path: &Path,
@@ -93,6 +104,7 @@ impl ChunkingEngine {
     ///
     /// **Atenção:** para arquivos muito grandes (>2 GiB) prefira
     /// [`stream_and_encrypt_chunks`] que evita acumular todos os bytes na RAM.
+    #[allow(dead_code)]
     pub async fn split_and_encrypt_file_with_progress<F>(
         &self,
         path: &Path,

@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    name: Test And Smoke Build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: telegram-drive/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            telegram-drive -> target
+
+      - name: Install NPM dependencies
+        working-directory: telegram-drive
+        run: npm ci
+
+      - name: Install Playwright browser
+        working-directory: telegram-drive
+        run: npx playwright install --with-deps chromium
+
+      - name: Cargo check
+        working-directory: telegram-drive
+        run: cargo check
+
+      - name: Cargo test
+        working-directory: telegram-drive
+        run: cargo test -- --nocapture
+
+      - name: Frontend E2E
+        working-directory: telegram-drive
+        run: npm run test:e2e
+
+      - name: Tauri smoke build
+        working-directory: telegram-drive
+        run: npm run build:desktop:ci
+
+  cross-platform-build:
+    name: Build Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: telegram-drive/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            telegram-drive -> target
+
+      - name: Install NPM dependencies
+        working-directory: telegram-drive
+        run: npm ci
+
+      - name: Cargo check
+        working-directory: telegram-drive
+        run: cargo check
+
+      - name: Tauri smoke build
+        working-directory: telegram-drive
+        run: npm run build:desktop:ci

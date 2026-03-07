@@ -16,6 +16,7 @@ pub enum AppError {
     Telegram(String),
     #[error("validation error: {0}")]
     Validation(String),
+    #[allow(dead_code)]
     #[error("not found: {0}")]
     NotFound(String),
     #[error("concurrency error: {0}")]
@@ -62,6 +63,7 @@ pub enum AuthState {
     LoggedIn,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FileType {
     Image,
@@ -156,6 +158,7 @@ pub struct TransferStatus {
     pub updated_at: DateTime<Utc>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMeta {
     pub id: i64,
@@ -177,6 +180,7 @@ pub struct ChunkDescriptor {
     pub bytes: Vec<u8>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadJob {
     pub job_id: String,
@@ -185,6 +189,7 @@ pub struct UploadJob {
     pub state: TransferState,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadJob {
     pub job_id: String,
@@ -403,6 +408,7 @@ pub fn classify_mime(path: &std::path::Path) -> String {
         .to_string()
 }
 
+#[allow(dead_code)]
 pub fn file_type_from_mime(mime: &str) -> FileType {
     if mime.starts_with("image/") {
         FileType::Image

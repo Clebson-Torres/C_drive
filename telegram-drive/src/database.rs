@@ -13,6 +13,7 @@ pub struct ChunkIndexRow {
     pub hash: String,
     pub telegram_file_id: String,
     pub size: i64,
+    #[allow(dead_code)]
     pub ref_count: i64,
     pub nonce_b64: String,
 }
@@ -201,6 +202,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn root_folder_id(&self) -> AppResult<i64> {
         let conn = self.lock_conn()?;
         let id: i64 = conn.query_row(

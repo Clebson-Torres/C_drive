@@ -35,7 +35,9 @@ impl Default for PersistedState {
 }
 
 pub struct PersistentSession {
+    #[allow(dead_code)]
     path: PathBuf,
+    #[allow(dead_code)]
     key: [u8; 32],
     cache: Arc<RwLock<PersistedState>>,
     save_tx: mpsc::UnboundedSender<()>,
@@ -76,6 +78,7 @@ impl PersistentSession {
         let _ = self.save_tx.send(());
     }
 
+    #[cfg(test)]
     pub async fn flush_now(&self) {
         let snapshot = self.cache.read().await.clone();
         if let Err(e) = save_snapshot(&self.path, &self.key, &snapshot).await {

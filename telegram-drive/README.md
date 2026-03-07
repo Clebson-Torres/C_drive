@@ -1,4 +1,4 @@
-﻿# Telegram Drive
+﻿# Savedrive
 
 Desktop app em Rust + Tauri para gerenciamento de arquivos com backend Telegram, com cache local, deduplicacao, upload/download paralelo e UI de file manager.
 
@@ -81,3 +81,4 @@ Spans de tracing para:
 
 Runtime log:
 - `logs/telegram/runtime.log`
+

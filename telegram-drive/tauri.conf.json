@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Telegram Drive",
+  "productName": "Savedrive",
   "version": "0.1.0",
   "identifier": "com.telegram.drive",
   "build": {
@@ -11,7 +11,7 @@
   "app": {
     "windows": [
       {
-        "title": "Telegram Drive",
+        "title": "Savedrive",
         "width": 1280,
         "height": 840,
         "resizable": true,
@@ -23,9 +23,13 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": "all",
     "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
       "icons/icon.ico"
     ]
   }

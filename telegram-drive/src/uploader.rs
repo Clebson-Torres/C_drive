@@ -648,13 +648,6 @@ impl UploadService {
 /// Tenta coletar resultados prontos do JoinSet sem bloquear.
 /// Sem tokio_unstable, retorna None — os resultados são coletados
 /// no loop final de join_next ao fim do pipeline. Correto e seguro.
-fn drain_ready<T>(_set: &mut JoinSet<T>) -> Option<T>
-where
-    T: 'static,
-{
-    None
-}
-
 fn compute_parallelism(max_parallelism: usize) -> usize {
     let cpu = std::thread::available_parallelism()
         .map(|n| n.get())

@@ -135,6 +135,7 @@ async fn upload_download_matrix_real_files() {
         dedup.clone(),
         chunking.clone(),
         telegram.clone(),
+        cache.clone(),
         progress.clone(),
     );
     let downloader = DownloadService::new(
@@ -338,11 +339,18 @@ async fn compare_real_upload_chunk_profiles() {
             .set_setting_json("auth.prefill", &auth_prefill)
             .unwrap();
         let dedup = DedupEngine::new(db_for_run.clone());
+        let cache = LocalCdnCache::new(
+            temp.path().join(format!("compare-cache-{chunk_size}")),
+            8 * 1024 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
         let uploader = UploadService::new(
             db_for_run.clone(),
             dedup,
             ChunkingEngine::new(chunk_size, key),
             telegram.clone(),
+            cache,
             progress.clone(),
         );
         let run_root_id = db_for_run.root_folder_id().unwrap();
