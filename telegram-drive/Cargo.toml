@@ -22,6 +22,7 @@ grammers-session = { version = "0.9", default-features = false, features = ["ser
 hex = "0.4"
 mime_guess = "2"
 moka = { version = "0.12", features = ["future"] }
+pbkdf2 = "0.12"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 serde = { version = "1", features = ["derive"] }

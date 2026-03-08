@@ -1,11 +1,11 @@
 use crate::models::{
-    AppError, AppResult, FileEntry, Folder, FolderListResponse, SearchQuery, SettingsDto,
-    StorageMode,
+    AppError, AppResult, FileEntry, FileOrigin, Folder, FolderListResponse, SearchQuery,
+    SettingsDto, StorageMode,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,7 @@ pub struct NewFileRecord {
     pub original_path: Option<String>,
     pub storage_mode: StorageMode,
     pub telegram_file_id: Option<String>,
+    pub origin: FileOrigin,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub struct NewChunkRecord {
 
 #[derive(Clone)]
 pub struct Database {
+    path: PathBuf,
     conn: Arc<Mutex<Connection>>,
 }
 
@@ -57,6 +59,7 @@ impl Database {
             ",
         )?;
         let db = Self {
+            path: path.to_path_buf(),
             conn: Arc::new(Mutex::new(conn)),
         };
         db.migrate()?;
@@ -72,6 +75,10 @@ impl Database {
 
     fn now() -> DateTime<Utc> {
         Utc::now()
+    }
+
+    pub fn app_dir(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new("."))
     }
 
     fn migrate(&self) -> AppResult<()> {
@@ -97,7 +104,8 @@ impl Database {
                 updated_at TEXT NOT NULL,
                 original_path TEXT NULL,
                 storage_mode TEXT NOT NULL DEFAULT 'chunked',
-                telegram_file_id TEXT NULL
+                telegram_file_id TEXT NULL,
+                origin TEXT NOT NULL DEFAULT 'savedrive'
             );
 
             CREATE TABLE IF NOT EXISTS chunks (
@@ -170,6 +178,12 @@ impl Database {
                 [],
             )?;
         }
+        if !has_column(&conn, "files", "origin")? {
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN origin TEXT NOT NULL DEFAULT 'savedrive'",
+                [],
+            )?;
+        }
         if !has_column(&conn, "chunk_index", "nonce_b64")? {
             conn.execute(
                 "ALTER TABLE chunk_index ADD COLUMN nonce_b64 TEXT NOT NULL DEFAULT ''",
@@ -185,6 +199,10 @@ impl Database {
 
     fn ensure_root_folder(&self) -> AppResult<()> {
         let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE folders SET name = 'Saved Messages', updated_at = ?1 WHERE parent_id IS NULL AND name = 'Root'",
+            params![Self::now().to_rfc3339()],
+        )?;
         let existing: Option<i64> = conn
             .query_row(
                 "SELECT id FROM folders WHERE parent_id IS NULL LIMIT 1",
@@ -196,13 +214,12 @@ impl Database {
             let now = Self::now().to_rfc3339();
             conn.execute(
                 "INSERT INTO folders(name, parent_id, created_at, updated_at) VALUES(?1, NULL, ?2, ?3)",
-                params!["Root", now, now],
+                params!["Saved Messages", now, now],
             )?;
         }
         Ok(())
     }
 
-    #[cfg(test)]
     pub fn root_folder_id(&self) -> AppResult<i64> {
         let conn = self.lock_conn()?;
         let id: i64 = conn.query_row(
@@ -258,6 +275,7 @@ impl Database {
             original_path: row.get(8)?,
             storage_mode: parse_storage_mode(row.get::<_, String>(9)?)?,
             telegram_file_id: row.get(10)?,
+            origin: parse_file_origin(row.get::<_, String>(11)?)?,
         })
     }
 
@@ -282,7 +300,7 @@ impl Database {
 
         let files = {
             let mut stmt = conn.prepare(
-                "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id
+                "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id, origin
                  FROM files WHERE folder_id = ?1 ORDER BY name ASC LIMIT ?2 OFFSET ?3",
             )?;
             let rows = stmt.query_map(params![folder_id, limit, offset], Self::file_from_row)?;
@@ -314,9 +332,9 @@ impl Database {
         let needle = format!("%{}%", query.query);
         let conn = self.lock_conn()?;
 
-        let files_sql_folder = "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id
+        let files_sql_folder = "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id, origin
              FROM files WHERE folder_id = ?1 AND name LIKE ?2 ORDER BY name ASC LIMIT ?3 OFFSET ?4";
-        let files_sql_all = "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id
+        let files_sql_all = "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id, origin
              FROM files WHERE name LIKE ?1 ORDER BY name ASC LIMIT ?2 OFFSET ?3";
 
         let files = if let Some(fid) = query.folder_id {
@@ -375,10 +393,23 @@ impl Database {
     pub fn get_file(&self, id: i64) -> AppResult<FileEntry> {
         let conn = self.lock_conn()?;
         conn.query_row(
-            "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id FROM files WHERE id=?1",
+            "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id, origin FROM files WHERE id=?1",
             params![id],
             Self::file_from_row,
         )
+        .map_err(AppError::from)
+    }
+
+    #[cfg(test)]
+    pub fn find_file_by_telegram_file_id(&self, telegram_file_id: &str) -> AppResult<Option<FileEntry>> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id, origin
+             FROM files WHERE telegram_file_id = ?1 LIMIT 1",
+            params![telegram_file_id],
+            Self::file_from_row,
+        )
+        .optional()
         .map_err(AppError::from)
     }
 
@@ -426,8 +457,8 @@ impl Database {
         let tx = conn.transaction()?;
         let now = Self::now().to_rfc3339();
         tx.execute(
-            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id, origin)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 file.name,
                 file.size,
@@ -438,7 +469,8 @@ impl Database {
                 now,
                 file.original_path,
                 storage_mode_to_str(&file.storage_mode),
-                file.telegram_file_id
+                file.telegram_file_id,
+                file_origin_to_str(&file.origin)
             ],
         )?;
         let file_id = tx.last_insert_rowid();
@@ -484,9 +516,9 @@ impl Database {
     ) -> AppResult<i64> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
-        let source: (i64, String, i64, String, String, Option<String>, String, Option<String>) =
+        let source: (i64, String, i64, String, String, Option<String>, String, Option<String>, String) =
             tx.query_row(
-                "SELECT id, hash, size, mime_type, created_at, original_path, storage_mode, telegram_file_id FROM files WHERE id=?1",
+                "SELECT id, hash, size, mime_type, created_at, original_path, storage_mode, telegram_file_id, origin FROM files WHERE id=?1",
                 params![source_file_id],
                 |r| {
                     Ok((
@@ -498,13 +530,14 @@ impl Database {
                         r.get(5)?,
                         r.get(6)?,
                         r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )?;
         let now = Self::now().to_rfc3339();
         tx.execute(
-            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id, origin)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 destination_name,
                 source.2,
@@ -515,7 +548,8 @@ impl Database {
                 now,
                 source.5,
                 source.6,
-                source.7
+                source.7,
+                source.8
             ],
         )?;
         let new_file_id = tx.last_insert_rowid();
@@ -768,6 +802,71 @@ impl Database {
         let rows = stmt.query_map([], Self::folder_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+
+    pub fn upsert_imported_file(
+        &self,
+        file: NewFileRecord,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> AppResult<i64> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let existing_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM files WHERE telegram_file_id = ?1 LIMIT 1",
+                params![file.telegram_file_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(file_id) = existing_id {
+            tx.execute(
+                "UPDATE files
+                 SET size = ?1,
+                     mime_type = ?2,
+                     updated_at = ?3,
+                     storage_mode = ?4,
+                     origin = ?5
+                 WHERE id = ?6",
+                params![
+                    file.size,
+                    file.mime_type,
+                    updated_at.to_rfc3339(),
+                    storage_mode_to_str(&file.storage_mode),
+                    file_origin_to_str(&file.origin),
+                    file_id
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(file_id);
+        }
+
+        tx.execute(
+            "INSERT INTO files(name, size, hash, folder_id, mime_type, created_at, updated_at, original_path, storage_mode, telegram_file_id, origin)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                file.name,
+                file.size,
+                file.hash,
+                file.folder_id,
+                file.mime_type,
+                created_at.to_rfc3339(),
+                updated_at.to_rfc3339(),
+                file.original_path,
+                storage_mode_to_str(&file.storage_mode),
+                file.telegram_file_id,
+                file_origin_to_str(&file.origin)
+            ],
+        )?;
+        let file_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT OR IGNORE INTO file_hash_index(hash, canonical_file_id, ref_count, created_at, updated_at)
+             VALUES(?1, ?2, 1, ?3, ?4)",
+            params![file.hash, file_id, created_at.to_rfc3339(), updated_at.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(file_id)
+    }
 }
 
 fn append_suffix(name: &str, n: u32) -> String {
@@ -823,13 +922,75 @@ fn storage_mode_to_str(mode: &StorageMode) -> &'static str {
     }
 }
 
+fn parse_file_origin(value: String) -> rusqlite::Result<FileOrigin> {
+    match value.as_str() {
+        "savedrive" => Ok(FileOrigin::Savedrive),
+        "imported" => Ok(FileOrigin::Imported),
+        other => Err(rusqlite::Error::FromSqlConversionFailure(
+            other.len(),
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown file origin {other}"),
+            )),
+        )),
+    }
+}
+
+fn file_origin_to_str(origin: &FileOrigin) -> &'static str {
+    match origin {
+        FileOrigin::Savedrive => "savedrive",
+        FileOrigin::Imported => "imported",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use tempfile::tempdir;
 
     #[test]
     fn deterministic_suffix() {
         assert_eq!(append_suffix("file.txt", 1), "file (1).txt");
         assert_eq!(append_suffix("archive", 2), "archive (2)");
+    }
+
+    #[test]
+    fn root_folder_is_saved_messages() {
+        let temp = tempdir().unwrap();
+        let db = Database::open(&temp.path().join("db.sqlite")).unwrap();
+        let root = db.get_folder(db.root_folder_id().unwrap()).unwrap();
+        assert_eq!(root.name, "Saved Messages");
+    }
+
+    #[test]
+    fn imported_file_upsert_deduplicates_by_telegram_file_id() {
+        let temp = tempdir().unwrap();
+        let db = Database::open(&temp.path().join("db.sqlite")).unwrap();
+        let root_id = db.root_folder_id().unwrap();
+        let created = Utc::now();
+        let record = NewFileRecord {
+            name: "photo.jpg".to_string(),
+            size: 2048,
+            hash: "telegram-import:42".to_string(),
+            folder_id: root_id,
+            mime_type: "image/jpeg".to_string(),
+            original_path: None,
+            storage_mode: StorageMode::Single,
+            telegram_file_id: Some("42".to_string()),
+            origin: FileOrigin::Imported,
+        };
+
+        let first = db
+            .upsert_imported_file(record.clone(), created, created)
+            .unwrap();
+        let second = db
+            .upsert_imported_file(record, created, created)
+            .unwrap();
+
+        assert_eq!(first, second);
+        let file = db.find_file_by_telegram_file_id("42").unwrap().unwrap();
+        assert_eq!(file.origin, FileOrigin::Imported);
     }
 }

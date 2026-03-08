@@ -10,6 +10,7 @@ mod file_index;
 mod models;
 mod performance;
 mod progress;
+mod security;
 mod session_store;
 mod telegram;
 #[cfg(test)]
@@ -58,12 +59,7 @@ async fn auth_start(
     state: State<'_, AppState>,
     input: AuthStartInput,
 ) -> Result<ApiResponse<AuthState>, String> {
-    Ok(map_response(
-        state
-            .auth
-            .start_phone_auth(input.phone, input.api_id, input.api_hash)
-            .await,
-    ))
+    Ok(map_response(state.auth.start_phone_auth(input.phone).await))
 }
 
 #[tauri::command]
@@ -111,6 +107,13 @@ async fn auth_logout(
         let _ = app.emit("auth_state_changed", AuthState::LoggedOut);
     }
     Ok(response)
+}
+
+#[tauri::command]
+async fn sync_saved_messages_index(
+    state: State<'_, AppState>,
+) -> Result<ApiResponse<usize>, String> {
+    Ok(map_response(state.auth.sync_saved_messages_index().await))
 }
 
 // ─── Listagem ──────────────────────────────────────────────────────────────
@@ -304,6 +307,22 @@ async fn pick_folder_native() -> Result<ApiResponse<Option<String>>, String> {
             .set_title("Select folder to upload")
             .pick_folder()
             .map(|p| p.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(ApiResponse::ok(selected))
+}
+
+#[tauri::command]
+async fn pick_save_file_native(
+    suggested_name: Option<String>,
+) -> Result<ApiResponse<Option<String>>, String> {
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new().set_title("Select download destination");
+        if let Some(name) = suggested_name.as_deref() {
+            dialog = dialog.set_file_name(name);
+        }
+        dialog.save_file().map(|p| p.to_string_lossy().to_string())
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -535,6 +554,7 @@ async fn main() {
             auth_profile,
             auth_prefill,
             auth_logout,
+            sync_saved_messages_index,
             list_folder,
             folder_tree,
             create_folder,
@@ -547,6 +567,7 @@ async fn main() {
             upload_folder,
             pick_files_native,
             pick_folder_native,
+            pick_save_file_native,
             download_file,
             preview_image,
             transfer_cancel,

@@ -3,8 +3,8 @@ use crate::chunking::{ChunkPipelineProgress, ChunkingEngine};
 use crate::database::{Database, NewChunkRecord, NewFileRecord};
 use crate::dedup::DedupEngine;
 use crate::models::{
-    classify_mime, normalize_chunk_size_bytes, AppError, AppResult, StorageMode, TransferPhase,
-    TransferState,
+    classify_mime, normalize_chunk_size_bytes, AppError, AppResult, FileOrigin, StorageMode,
+    TransferPhase, TransferState,
 };
 use crate::progress::ProgressHub;
 use crate::telegram::TelegramClient;
@@ -253,6 +253,7 @@ impl UploadService {
                 original_path: Some(file_path.to_string_lossy().to_string()),
                 storage_mode: StorageMode::Single,
                 telegram_file_id: Some(telegram_file_id),
+                origin: FileOrigin::Savedrive,
             },
             Vec::new(),
         )?;
@@ -627,6 +628,7 @@ impl UploadService {
                 original_path: Some(file_path.to_string_lossy().to_string()),
                 storage_mode: StorageMode::Chunked,
                 telegram_file_id: None,
+                origin: FileOrigin::Savedrive,
             },
             uploaded,
         )?;

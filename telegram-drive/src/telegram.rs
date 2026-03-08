@@ -1,6 +1,11 @@
-use crate::models::{AppError, AppResult, AuthState, UserProfileDto};
+use crate::models::{
+    default_telegram_api_hash, default_telegram_api_id, AppError, AppResult, AuthState,
+    UserProfileDto,
+};
 use crate::session_store::PersistentSession;
+use chrono::{DateTime, Utc};
 use grammers_client::client::{LoginToken, PasswordToken};
+use grammers_client::media::Media;
 use grammers_client::message::InputMessage;
 use grammers_client::peer::Peer;
 use grammers_client::{Client, SignInError};
@@ -20,6 +25,15 @@ use uuid::Uuid;
 // Cada um tem seu próprio SenderPool → conexão MTProto independente.
 // 4 é conservador; pode subir para 8 se não houver flood errors.
 const UPLOAD_POOL_SIZE: usize = 4;
+
+#[derive(Debug, Clone)]
+pub struct ImportedSavedMessageFile {
+    pub telegram_file_id: String,
+    pub name: String,
+    pub size: i64,
+    pub mime_type: String,
+    pub created_at: DateTime<Utc>,
+}
 
 #[derive(Clone)]
 pub struct TelegramClient {
@@ -52,7 +66,7 @@ impl UploadClientPool {
 
     /// Inicializa N clientes compartilhando a mesma sessão já autenticada.
     /// Chamado uma única vez após login bem-sucedido.
-    async fn init(&self, session_path: &Path, api_id: i32, n: usize) -> AppResult<()> {
+    async fn init(&self, session_path: &Path, n: usize) -> AppResult<()> {
         let mut clients = self
             .clients
             .lock()
@@ -71,7 +85,7 @@ impl UploadClientPool {
         for i in 0..n {
             // Cada cliente lê a mesma sessão em disco — já tem auth_key
             let session = Arc::new(PersistentSession::open_or_create(session_path));
-            let sender_pool = SenderPool::new(session, api_id);
+            let sender_pool = SenderPool::new(session, default_telegram_api_id());
             let client = Client::new(sender_pool.handle.clone());
             let task = tokio::spawn(async move {
                 let _ = sender_pool.runner.run().await;
@@ -115,8 +129,6 @@ impl UploadClientPool {
 
 struct AuthContext {
     state: AuthState,
-    api_id: Option<i32>,
-    api_hash: Option<String>,
     phone: Option<String>,
     client: Option<Client>,
     runner_task: Option<JoinHandle<()>>,
@@ -150,8 +162,6 @@ impl TelegramClient {
             upload_pool: UploadClientPool::new(),
             auth: Arc::new(Mutex::new(AuthContext {
                 state: AuthState::LoggedOut,
-                api_id: None,
-                api_hash: None,
                 phone: None,
                 client: None,
                 runner_task: None,
@@ -178,40 +188,30 @@ impl TelegramClient {
             .map_err(|_| AppError::Concurrency("auth mutex poisoned".to_string()))
     }
 
-    pub async fn start_phone_auth(
-        &self,
-        phone: String,
-        api_id: i32,
-        api_hash: String,
-    ) -> AppResult<AuthState> {
+    pub async fn start_phone_auth(&self, phone: String) -> AppResult<AuthState> {
+        let api_hash = default_telegram_api_hash();
         if self.mock_mode {
             let mut auth = self.auth_lock()?;
             auth.phone = Some(phone);
-            auth.api_id = Some(api_id);
-            auth.api_hash = Some(api_hash);
             auth.state = AuthState::AwaitingCode;
             return Ok(auth.state.clone());
         }
 
-        let client = self.ensure_client(api_id).await?;
+        let client = self.ensure_client().await?;
 
         if client
             .is_authorized()
             .await
             .map_err(|e| AppError::Telegram(format!("is_authorized failed: {e}")))?
         {
-            // Extrai api_id antes de qualquer await para não segurar MutexGuard
-            let api_id_val = {
+            {
                 let mut auth = self.auth_lock()?;
                 auth.state = AuthState::LoggedIn;
                 auth.phone = Some(phone);
-                auth.api_id = Some(api_id);
-                auth.api_hash = Some(api_hash);
                 auth.login_token = None;
                 auth.password_token = None;
-                api_id
-            };
-            self.init_upload_pool(api_id_val).await?;
+            }
+            self.init_upload_pool().await?;
             return Ok(AuthState::LoggedIn);
         }
 
@@ -222,8 +222,6 @@ impl TelegramClient {
 
         let mut auth = self.auth_lock()?;
         auth.phone = Some(phone);
-        auth.api_id = Some(api_id);
-        auth.api_hash = Some(api_hash);
         auth.login_token = Some(token);
         auth.password_token = None;
         auth.state = AuthState::AwaitingCode;
@@ -259,15 +257,12 @@ impl TelegramClient {
 
         match client.sign_in(&token, code.trim()).await {
             Ok(_) => {
-                let api_id = {
+                {
                     let mut auth = self.auth_lock()?;
                     auth.state = AuthState::LoggedIn;
                     auth.password_token = None;
-                    auth.api_id
-                };
-                if let Some(id) = api_id {
-                    self.init_upload_pool(id).await?;
                 }
+                self.init_upload_pool().await?;
                 Ok(AuthState::LoggedIn)
             }
             Err(SignInError::PasswordRequired(password_token)) => {
@@ -307,14 +302,11 @@ impl TelegramClient {
             .await
             .map_err(|e| AppError::Telegram(format!("check_password failed: {e}")))?;
 
-        let api_id = {
+        {
             let mut auth = self.auth_lock()?;
             auth.state = AuthState::LoggedIn;
-            auth.api_id
-        };
-        if let Some(id) = api_id {
-            self.init_upload_pool(id).await?;
         }
+        self.init_upload_pool().await?;
         Ok(AuthState::LoggedIn)
     }
 
@@ -323,21 +315,17 @@ impl TelegramClient {
             return Ok(self.auth_state());
         }
 
-        let api_id = match self.auth_lock()?.api_id {
-            Some(id) => id,
-            None => return Ok(AuthState::LoggedOut),
-        };
-
-        let client = self.ensure_client(api_id).await?;
+        let client = self.ensure_client().await?;
         if client
             .is_authorized()
             .await
             .map_err(|e| AppError::Telegram(format!("is_authorized failed: {e}")))?
         {
-            let mut auth = self.auth_lock()?;
-            auth.state = AuthState::LoggedIn;
-            drop(auth);
-            self.init_upload_pool(api_id).await?;
+            {
+                let mut auth = self.auth_lock()?;
+                auth.state = AuthState::LoggedIn;
+            }
+            self.init_upload_pool().await?;
             return Ok(AuthState::LoggedIn);
         }
 
@@ -345,22 +333,16 @@ impl TelegramClient {
     }
 
     /// Inicializa o pool de clientes de upload após autenticação.
-    async fn init_upload_pool(&self, api_id: i32) -> AppResult<()> {
+    async fn init_upload_pool(&self) -> AppResult<()> {
         if self.mock_mode {
             return Ok(());
         }
-        self.upload_pool
-            .init(&self.session_path, api_id, UPLOAD_POOL_SIZE)
-            .await
+        self.upload_pool.init(&self.session_path, UPLOAD_POOL_SIZE).await
     }
 
     pub async fn profile(&self) -> AppResult<UserProfileDto> {
         self.ensure_auth()?;
-        let api_id = self
-            .auth_lock()?
-            .api_id
-            .ok_or_else(|| AppError::Telegram("missing api_id".to_string()))?;
-        let client = self.ensure_client(api_id).await?;
+        let client = self.ensure_client().await?;
 
         let me = client
             .get_me()
@@ -393,6 +375,34 @@ impl TelegramClient {
             phone_masked: me.phone().map(mask_phone),
             avatar_path_opt,
         })
+    }
+
+    pub async fn list_saved_message_files(&self) -> AppResult<Vec<ImportedSavedMessageFile>> {
+        self.ensure_auth()?;
+        if self.mock_mode {
+            return Ok(Vec::new());
+        }
+
+        let client = self.ensure_client().await?;
+        let peer = self.saved_messages_peer(&client).await?;
+        let mut messages = client.iter_messages(peer);
+        let mut imported = Vec::new();
+
+        while let Some(message) = messages
+            .next()
+            .await
+            .map_err(|e| AppError::Telegram(format!("iter_messages failed: {e}")))?
+        {
+            if message.text() == "tgdrive-chunk" {
+                continue;
+            }
+
+            if let Some(file) = imported_file_from_message(&message) {
+                imported.push(file);
+            }
+        }
+
+        Ok(imported)
     }
 
     pub async fn logout(&self) -> AppResult<()> {
@@ -445,26 +455,12 @@ impl TelegramClient {
         }
 
         // Tenta o pool de upload primeiro; se não estiver pronto cai no cliente principal
-        let client = self
-            .upload_pool
-            .next()
-            .or_else(|_| {
-                let api_id = self
-                    .auth_lock()?
-                    .api_id
-                    .ok_or_else(|| AppError::Telegram("missing api_id".to_string()))?;
-                // fallback síncrono não funciona aqui — propaga o erro do pool
-                Err(AppError::Telegram(format!(
-                    "upload pool indisponível; api_id={api_id}"
-                )))
-            })
-            .or_else(|_| {
-                // último recurso: cliente de auth
-                self.auth_lock()?
-                    .client
-                    .clone()
-                    .ok_or_else(|| AppError::Telegram("no client available".to_string()))
-            })?;
+        let client = self.upload_pool.next().or_else(|_| {
+            self.auth_lock()?
+                .client
+                .clone()
+                .ok_or_else(|| AppError::Telegram("no client available".to_string()))
+        })?;
 
         let peer = self.saved_messages_peer(&client).await?;
         let file_name = sanitize_upload_name(original_name);
@@ -518,11 +514,7 @@ impl TelegramClient {
                 .await;
         }
 
-        let api_id = self
-            .auth_lock()?
-            .api_id
-            .ok_or_else(|| AppError::Telegram("missing api_id in auth context".to_string()))?;
-        let client = self.ensure_client(api_id).await?;
+        let client = self.ensure_client().await?;
         let peer = self.saved_messages_peer(&client).await?;
         let source_path = source_path.to_path_buf();
 
@@ -562,11 +554,7 @@ impl TelegramClient {
             return Ok(());
         }
 
-        let api_id = self
-            .auth_lock()?
-            .api_id
-            .ok_or_else(|| AppError::Telegram("missing api_id".to_string()))?;
-        let client = self.ensure_client(api_id).await?;
+        let client = self.ensure_client().await?;
         let peer = self.saved_messages_peer(&client).await?;
         let msg_id: i32 = message_id
             .parse()
@@ -649,9 +637,7 @@ impl TelegramClient {
         let auth = self.auth_lock()?;
         let payload = serde_json::json!({
             "state": auth.state,
-            "api_id": auth.api_id,
-            "api_hash": auth.api_hash,
-            "phone": auth.phone
+                        "phone": auth.phone
         });
         Ok(serde_json::to_vec(&payload)?)
     }
@@ -663,8 +649,6 @@ impl TelegramClient {
 
         let mut auth = self.auth_lock()?;
         auth.state = state.clone();
-        auth.api_id = value["api_id"].as_i64().map(|v| v as i32);
-        auth.api_hash = value["api_hash"].as_str().map(ToOwned::to_owned);
         auth.phone = value["phone"].as_str().map(ToOwned::to_owned);
         Ok(auth.state.clone())
     }
@@ -691,13 +675,13 @@ impl TelegramClient {
             .ok_or_else(|| AppError::Telegram("unable to resolve self peer".to_string()))
     }
 
-    async fn ensure_client(&self, api_id: i32) -> AppResult<Client> {
+    async fn ensure_client(&self) -> AppResult<Client> {
         if let Some(client) = self.auth_lock()?.client.clone() {
             return Ok(client);
         }
 
         let session = Arc::new(PersistentSession::open_or_create(&self.session_path));
-        let sender_pool = SenderPool::new(session, api_id);
+        let sender_pool = SenderPool::new(session, default_telegram_api_id());
         let client = Client::new(sender_pool.handle.clone());
         let runner_task = tokio::spawn(async move {
             let _ = sender_pool.runner.run().await;
@@ -740,6 +724,35 @@ fn sanitize_upload_name(name: &str) -> String {
         .unwrap_or("bin");
     let random: u32 = rand::thread_rng().gen();
     format!("chunk-{random:08x}.{ext}")
+}
+
+fn imported_file_from_message(
+    message: &grammers_client::message::Message,
+) -> Option<ImportedSavedMessageFile> {
+    match message.media()? {
+        Media::Document(document) => Some(ImportedSavedMessageFile {
+            telegram_file_id: message.id().to_string(),
+            name: document
+                .name()
+                .map(ToOwned::to_owned)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("document-{}.bin", message.id())),
+            size: document.size().unwrap_or(0) as i64,
+            mime_type: document
+                .mime_type()
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            created_at: message.date(),
+        }),
+        Media::Photo(photo) => Some(ImportedSavedMessageFile {
+            telegram_file_id: message.id().to_string(),
+            name: format!("photo-{}.jpg", message.id()),
+            size: photo.size().unwrap_or(0) as i64,
+            mime_type: "image/jpeg".to_string(),
+            created_at: message.date(),
+        }),
+        _ => None,
+    }
 }
 
 fn mask_phone(phone: &str) -> String {

@@ -2,11 +2,12 @@ import { expect, test } from "@playwright/test";
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
+    (window as any).__TEST_LOCALE__ = "pt-BR";
     let authState = "LoggedOut";
     const folders = [
       {
         id: 1,
-        name: "Root",
+        name: "Saved Messages",
         parent_id: null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
@@ -23,7 +24,7 @@ test.beforeEach(async ({ page }) => {
             case "auth_status":
               return ok(authState);
             case "auth_prefill":
-              return ok({ phone: "+551100000000", api_id: 37673970, api_hash: "hash" });
+              return ok({ phone: "+551100000000" });
             case "auth_start":
               authState = "AwaitingCode";
               return ok(authState);
@@ -39,12 +40,16 @@ test.beforeEach(async ({ page }) => {
               });
             case "folder_tree":
               return ok(folders);
+            case "sync_saved_messages_index":
+              return ok(0);
             case "list_folder":
               return ok({ folders: [], files: [], total_folders: 0, total_files: 0 });
             case "pick_files_native":
               return ok(["C:/tmp/x.txt"]);
             case "pick_folder_native":
               return ok("C:/tmp/folder-A");
+            case "pick_save_file_native":
+              return ok("C:/tmp/downloads/archive.bin");
             case "upload_files":
               if (!Object.prototype.hasOwnProperty.call(args || {}, "folder_id")) {
                 return err("missing required key folder_id");

@@ -123,7 +123,7 @@ async fn upload_download_matrix_real_files() {
         .await
         .unwrap();
     telegram
-        .start_phone_auth("+551100000000".to_string(), 12345, "hash".to_string())
+        .start_phone_auth("+551100000000".to_string())
         .await
         .unwrap();
     telegram.verify_code("12345".to_string()).await.unwrap();

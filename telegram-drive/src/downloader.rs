@@ -3,7 +3,8 @@ use crate::chunking::ChunkingEngine;
 use crate::database::Database;
 use crate::models::{
     AppError, AppResult, CachePersistenceState, DownloadCacheEvent, DownloadCacheMode,
-    DownloadResponse, PreviewResponse, SettingsDto, StorageMode, TransferPhase, TransferState,
+    DownloadResponse, FileOrigin, PreviewResponse, SettingsDto, StorageMode, TransferPhase,
+    TransferState,
 };
 use crate::progress::ProgressHub;
 use crate::telegram::TelegramClient;
@@ -87,6 +88,7 @@ impl DownloadService {
                         &job_id,
                         &file.name,
                         &file.hash,
+                        &file.origin,
                         file.telegram_file_id,
                         destination_path,
                         total,
@@ -119,6 +121,7 @@ impl DownloadService {
         job_id: &str,
         file_name: &str,
         file_hash: &str,
+        file_origin: &FileOrigin,
         telegram_file_id: Option<String>,
         destination_path: PathBuf,
         total: u64,
@@ -183,7 +186,7 @@ impl DownloadService {
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let digest = hex::encode(hasher.finalize());
-        if digest != file_hash {
+        if should_validate_single_object_hash(file_hash, file_origin) && digest != file_hash {
             let _ = fs::remove_file(&temp_path).await;
             let err = AppError::Validation(format!(
                 "single-object hash mismatch expected={} got={}",
@@ -549,6 +552,40 @@ impl DownloadService {
             local_path: temp.to_string_lossy().to_string(),
             mime_type: file.mime_type,
         })
+    }
+}
+
+fn should_validate_single_object_hash(file_hash: &str, file_origin: &FileOrigin) -> bool {
+    if matches!(file_origin, FileOrigin::Imported) {
+        return is_sha256_hex(file_hash);
+    }
+    is_sha256_hex(file_hash)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_sha256_hex, should_validate_single_object_hash};
+    use crate::models::FileOrigin;
+
+    #[test]
+    fn validates_savedrive_single_files_with_real_sha256() {
+        let hash = "666b61e0d0b1baf4bb0f6b2160e20085c0371fa572368a2a5f28448354b7b18b";
+        assert!(is_sha256_hex(hash));
+        assert!(should_validate_single_object_hash(hash, &FileOrigin::Savedrive));
+    }
+
+    #[test]
+    fn skips_strict_hash_validation_for_imported_telegram_placeholders() {
+        let placeholder = "telegram-import:127809";
+        assert!(!is_sha256_hex(placeholder));
+        assert!(!should_validate_single_object_hash(
+            placeholder,
+            &FileOrigin::Imported
+        ));
     }
 }
 

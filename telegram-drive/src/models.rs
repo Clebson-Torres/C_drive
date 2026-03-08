@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("database error: {0}")]
@@ -80,6 +79,12 @@ pub enum StorageMode {
     Chunked,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FileOrigin {
+    Savedrive,
+    Imported,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DownloadCacheMode {
     Default,
@@ -138,6 +143,7 @@ pub struct FileEntry {
     pub original_path: Option<String>,
     pub storage_mode: StorageMode,
     pub telegram_file_id: Option<String>,
+    pub origin: FileOrigin,
 }
 
 /// Status de uma transferência (upload ou download).
@@ -217,17 +223,11 @@ pub struct FolderListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthStartInput {
     pub phone: String,
-    #[serde(default = "default_telegram_api_id")]
-    pub api_id: i32,
-    #[serde(default = "default_telegram_api_hash")]
-    pub api_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthPrefillDto {
     pub phone: String,
-    pub api_id: i32,
-    pub api_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

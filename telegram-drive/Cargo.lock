@@ -4288,6 +4288,7 @@ dependencies = [
  "hex",
  "mime_guess",
  "moka",
+ "pbkdf2",
  "rand 0.8.5",
  "rfd",
  "rusqlite",

@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply min-h-screen bg-shell-gradient text-slate-900 antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+}
+
+@layer components {
+  .primary-btn { @apply rounded-2xl bg-gradient-to-r from-sky-600 to-blue-700 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-sky-500/25 transition hover:brightness-105; }
+  .ghost-btn { @apply rounded-2xl border border-slate-200 bg-white/80 px-5 py-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-100; }
+  .danger-btn { @apply rounded-2xl border border-rose-200 bg-rose-50 px-5 py-3 text-sm font-semibold text-rose-700 transition hover:bg-rose-100; }
+  .table-btn { @apply rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-100; }
+  .modal-shell { @apply fixed inset-0 z-40 flex items-center justify-center bg-slate-950/45 px-6 py-10 backdrop-blur-sm; }
+  .modal-card { @apply w-full rounded-[32px] border border-white/70 bg-white/95 p-7 shadow-glass; }
+}
+
+.custom-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(59, 130, 246, 0.45) rgba(226, 232, 240, 0.65);
+}
+
+.custom-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.custom-scroll::-webkit-scrollbar-track {
+  background: rgba(226, 232, 240, 0.65);
+  border-radius: 999px;
+}
+
+.custom-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(14, 165, 233, 0.75), rgba(37, 99, 235, 0.85));
+  border-radius: 999px;
+  border: 2px solid rgba(226, 232, 240, 0.65);
+}

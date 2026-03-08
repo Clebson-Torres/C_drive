@@ -2,8 +2,9 @@ import { expect, test } from "@playwright/test";
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
+    (window as any).__TEST_LOCALE__ = "pt-BR";
     let authState = "LoggedOut";
-    const folders = [{ id: 1, name: "Root", parent_id: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }];
+    const folders = [{ id: 1, name: "Saved Messages", parent_id: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }];
     const calls: Array<{ cmd: string; args: any }> = [];
     const listeners = new Map<string, Array<(event: any) => void>>();
     (window as any).__TEST_CALLS__ = calls;
@@ -22,7 +23,7 @@ test.beforeEach(async ({ page }) => {
             case "auth_status":
               return ok(authState);
             case "auth_prefill":
-              return ok({ phone: "+551100000000", api_id: 37673970, api_hash: "hash" });
+              return ok({ phone: "+551100000000" });
             case "auth_start":
               if (!args?.input?.phone) {
                 return err("invalid auth input");
@@ -57,6 +58,8 @@ test.beforeEach(async ({ page }) => {
               return ok(authState);
             case "folder_tree":
               return ok(folders);
+            case "sync_saved_messages_index":
+              return ok(3);
             case "list_folder":
               return ok({
                 folders: [],
@@ -72,6 +75,7 @@ test.beforeEach(async ({ page }) => {
                   original_path: null,
                   storage_mode: "Chunked",
                   telegram_file_id: null,
+                  origin: "Savedrive",
                 }],
                 total_folders: 0,
                 total_files: 1,
@@ -104,6 +108,8 @@ test.beforeEach(async ({ page }) => {
               return ok([101, 102]);
             case "pick_folder_native":
               return ok("C:/tmp/folder-A");
+            case "pick_save_file_native":
+              return ok("C:/tmp/downloads/archive.bin");
             case "upload_folder":
               if (!Object.prototype.hasOwnProperty.call(args || {}, "folderId")) {
                 return err("missing folderId");
@@ -187,6 +193,7 @@ test("full login with code unlocks drive", async ({ page }) => {
 
   await expect(page.locator("#driveShell")).toBeVisible();
   await expect(page.locator("#folderTree li")).toHaveCount(1);
+  await expect(page.locator("#folderTree")).toContainText("Saved Messages");
 });
 
 test("2fa path requires password", async ({ page }) => {
@@ -299,6 +306,8 @@ test("download modal lets user override cache policy", async ({ page }) => {
   expect(downloadCall.args).toMatchObject({
     fileId: 88,
     file_id: 88,
+    destinationPath: "C:/tmp/downloads/archive.bin",
+    destination_path: "C:/tmp/downloads/archive.bin",
     cacheMode: "enabled",
     cache_mode: "enabled",
   });
@@ -414,4 +423,99 @@ test("native drag-drop uploads paths emitted by tauri", async ({ page }) => {
   const calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
   const uploadCall = calls.find((c: any) => c.cmd === "upload_files" && c.args.paths?.includes("C:/tmp/dropped.iso"));
   expect(uploadCall).toBeTruthy();
+});
+
+test("native drag-drop also supports raw array payload and dedupes duplicate dispatch", async ({ page }) => {
+  await login(page);
+  await page.evaluate(() => {
+    (window as any).__emitTauriEvent("tauri://drag-drop", ["C:/tmp/raw-drop.iso"]);
+    (window as any).__emitTauriEvent("tauri://drag-drop", { paths: ["C:/tmp/raw-drop.iso"] });
+  });
+
+  await expect(page.locator("#driveMessage")).toContainText("Upload iniciado para 1 arquivo");
+  const calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
+  const uploadCalls = calls.filter((c: any) => c.cmd === "upload_files" && c.args.paths?.includes("C:/tmp/raw-drop.iso"));
+  expect(uploadCalls).toHaveLength(1);
+});
+
+test("dom drag-drop reads dataTransfer files and dispatches a single upload", async ({ page }) => {
+  await login(page);
+  await page.evaluate(() => {
+    const dropZone = document.querySelector("#dropZone");
+    const event = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "dataTransfer", {
+      value: {
+        files: [{ path: "C:/tmp/dom-drop.iso", name: "dom-drop.iso" }],
+        items: [],
+      },
+    });
+    dropZone?.dispatchEvent(event);
+  });
+
+  await expect(page.locator("#driveMessage")).toContainText("Upload iniciado para 1 arquivo");
+  const calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
+  const uploadCalls = calls.filter((c: any) => c.cmd === "upload_files" && c.args.paths?.includes("C:/tmp/dom-drop.iso"));
+  expect(uploadCalls).toHaveLength(1);
+});
+
+test("locale follows system/browser locale with english fallback set", async ({ browser }) => {
+  const context = await browser.newContext({ locale: "en-US" });
+  const page = await context.newPage();
+  await page.addInitScript(() => {
+    (window as any).__TEST_LOCALE__ = "en-US";
+    let authState = "LoggedOut";
+    const folders = [{ id: 1, name: "Saved Messages", parent_id: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }];
+    const ok = (data: any) => ({ ok: true, data, error: null });
+    (window as any).__TAURI__ = {
+      core: {
+        invoke: async (cmd: string, args: any) => {
+          switch (cmd) {
+            case "auth_status":
+              return ok(authState);
+            case "auth_prefill":
+              return ok({ phone: "+551100000000" });
+            case "auth_start":
+              authState = "AwaitingCode";
+              return ok(authState);
+            case "auth_verify_code":
+              authState = "LoggedIn";
+              return ok(authState);
+            case "auth_profile":
+              return ok({ display_name: "Telegram User", username: "telegram_user", phone_masked: "***0000", avatar_path_opt: null });
+            case "folder_tree":
+              return ok(folders);
+            case "sync_saved_messages_index":
+              return ok(0);
+            case "list_folder":
+              return ok({ folders: [], files: [], total_folders: 0, total_files: 0 });
+            case "search":
+              return ok({ folders: [], files: [], total_folders: 0, total_files: 0 });
+            case "settings_get":
+              return ok({
+                chunk_size_bytes: 134217728,
+                max_parallelism: 16,
+                encrypt_chunks: true,
+                download_cache_default_mode: "Threshold",
+                download_cache_threshold_bytes: 2147483648,
+                download_cache_write_mode: "Background",
+              });
+            default:
+              return ok(null);
+          }
+        },
+      },
+      event: {
+        listen: async () => () => {},
+      },
+    };
+  });
+  await page.goto("/");
+  await expect(page.locator("#btnAuthStart")).toContainText("Continue");
+  await page.fill("#inputPhone", "+551100000000");
+  await page.click("#btnAuthStart");
+  await page.fill("#inputCode", "12345");
+  await page.click("#btnAuthCode");
+  await expect(page.locator("#btnUpload")).toContainText("Upload");
+  await expect(page.locator("#progressList")).toContainText("No active transfers.");
+  await context.close();
 });

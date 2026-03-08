@@ -9,6 +9,8 @@ src-tauri/target/
 # Node / frontend tooling
 node_modules/
 **/node_modules/
+dist/
+**/dist/
 
 # Test artifacts
 playwright-report/

@@ -2,11 +2,11 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     AeadCore, Aes256Gcm, Nonce,
 };
+use crate::security::derive_local_key;
 use futures_core::future::BoxFuture;
 use grammers_session::types::{DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
 use grammers_session::{Session, SessionData};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,7 +46,8 @@ pub struct PersistentSession {
 impl PersistentSession {
     pub fn open_or_create(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
-        let key = machine_key();
+        let key = derive_local_key(&salt_path_for(&path), "telegram-session-store")
+            .unwrap_or_else(|_| [0u8; 32]);
         let loaded = load_state_or_default(&path, &key);
         let cache = Arc::new(RwLock::new(loaded));
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<()>();
@@ -165,18 +166,8 @@ impl Session for PersistentSession {
     }
 }
 
-fn machine_key() -> [u8; 32] {
-    let seed = format!(
-        "{}:{}",
-        std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string()),
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "host".to_string())
-    );
-    let mut hasher = Sha256::new();
-    hasher.update(seed.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..32]);
-    out
+fn salt_path_for(path: &Path) -> PathBuf {
+    path.with_extension("salt")
 }
 
 fn load_state_or_default(path: &Path, key: &[u8; 32]) -> PersistedState {
