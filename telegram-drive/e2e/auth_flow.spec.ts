@@ -11,6 +11,9 @@ test.beforeEach(async ({ page }) => {
     (window as any).__emitTauriEvent = (name: string, payload: any) => {
       for (const cb of listeners.get(name) || []) cb({ payload });
     };
+    const emit = (name: string, payload: any) => {
+      for (const cb of listeners.get(name) || []) cb({ payload });
+    };
 
     const ok = (data: any) => ({ ok: true, data, error: null });
     const err = (message: string) => ({ ok: false, data: null, error: message });
@@ -121,12 +124,38 @@ test.beforeEach(async ({ page }) => {
             case "preview_image":
               return ok({ local_path: "C:/tmp/preview.png", mime_type: "image/png" });
             case "download_file":
+              emit("transfer_progress", {
+                job_id: "download-88",
+                file_name: "archive.bin",
+                state: "Queued",
+                phase: "Queued",
+                storage_mode: "Chunked",
+                bytes_done: 0,
+                bytes_total: 3 * 1024 * 1024 * 1024,
+                error: null,
+                speed_bps: 0,
+                eta_seconds: null,
+                started_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              });
+              emit("transfer_state_changed", {
+                job_id: "download-88",
+                file_name: "archive.bin",
+                state: "Queued",
+                phase: "Queued",
+                storage_mode: "Chunked",
+                bytes_done: 0,
+                bytes_total: 3 * 1024 * 1024 * 1024,
+                error: null,
+                speed_bps: 0,
+                eta_seconds: null,
+                started_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              });
               return ok({
-                cache_state: args?.cacheMode === "enabled" ? "Pending" : "Skipped",
+                cache_state: "Pending",
                 cache_mode: args?.cacheMode === "enabled" ? "Enabled" : "Disabled",
-                message: args?.cacheMode === "enabled"
-                  ? "Download concluído. Cache preenchendo em background."
-                  : "Download concluído sem preencher cache.",
+                message: "Download enfileirado.",
               });
             case "transfer_cancel":
               return ok(null);
@@ -298,7 +327,10 @@ test("download modal lets user override cache policy", async ({ page }) => {
   await expect(page.locator("#downloadCacheSummary")).toContainText("acima de 2.00 GB");
   await page.selectOption("#downloadCacheMode", "enabled");
   await page.click("#btnDownloadConfirm");
-  await expect(page.locator("#driveMessage")).toContainText("Cache preenchendo em background");
+  await expect(page.locator("#driveMessage")).toContainText("Download enfileirado.");
+  await expect(page.locator("#queueDrawer")).toBeVisible();
+  await expect(page.locator("#progressList")).toContainText("archive.bin");
+  await expect(page.locator(".dl-btn").first()).toBeDisabled();
 
   const calls = await page.evaluate(() => (window as any).__TEST_CALLS__);
   const downloadCall = calls.find((c: any) => c.cmd === "download_file");
@@ -313,8 +345,19 @@ test("download modal lets user override cache policy", async ({ page }) => {
   });
 });
 
+test("queue drawer toggles from header and workspace strip is removed", async ({ page }) => {
+  await login(page);
+  await expect(page.locator("#currentFolderLabel")).toHaveCount(0);
+  await expect(page.locator("#btnQueueToggle")).toBeVisible();
+  await page.click("#btnQueueToggle");
+  await expect(page.locator("#queueDrawer")).toBeVisible();
+  await page.click("#btnQueueClose");
+  await expect(page.locator("#queueDrawer")).toBeHidden();
+});
+
 test("queue shows transfer direction labels", async ({ page }) => {
   await login(page);
+  await page.click("#btnQueueToggle");
   await page.evaluate(() => {
     const event = new CustomEvent("__inject_transfer__", {
       detail: {
@@ -356,6 +399,7 @@ test("queue shows transfer direction labels", async ({ page }) => {
 
 test("queue supports pause and continue actions", async ({ page }) => {
   await login(page);
+  await page.click("#btnQueueToggle");
   await page.evaluate(() => {
     window.dispatchEvent(new CustomEvent("__inject_transfer__", {
       detail: {
@@ -516,6 +560,7 @@ test("locale follows system/browser locale with english fallback set", async ({ 
   await page.fill("#inputCode", "12345");
   await page.click("#btnAuthCode");
   await expect(page.locator("#btnUpload")).toContainText("Upload");
+  await page.click("#btnQueueToggle");
   await expect(page.locator("#progressList")).toContainText("No active transfers.");
   await context.close();
 });

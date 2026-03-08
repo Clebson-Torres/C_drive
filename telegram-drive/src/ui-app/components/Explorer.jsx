@@ -39,6 +39,7 @@ export default function Explorer({
   onDragOver,
   onDragLeave,
   onDrop,
+  isDownloadBusy,
   onFileDownload,
   onFilePreview,
 }) {
@@ -48,8 +49,8 @@ export default function Explorer({
   ];
 
   return (
-    <div className={`grid min-h-[520px] gap-6 xl:grid-cols-[250px_minmax(920px,1.75fr)_320px] ${dragActive ? "rounded-[34px] ring-4 ring-sky-200/80" : ""}`}>
-      <aside className="flex max-h-[72vh] min-h-0 flex-col rounded-[28px] border border-white/70 bg-white/50 p-5 shadow-glass backdrop-blur-xl">
+    <div className={`grid min-h-[520px] items-start gap-5 xl:grid-cols-[220px_minmax(0,1fr)_290px] ${dragActive ? "rounded-[34px] ring-4 ring-sky-200/80" : ""}`}>
+      <aside className="flex max-h-[72vh] min-h-0 flex-col overflow-hidden rounded-[28px] border border-white/70 bg-white/50 p-5 shadow-glass backdrop-blur-xl">
         <div className="mb-4 text-xs font-semibold uppercase tracking-[0.26em] text-sky-700">{t("explorer.folders")}</div>
         <ul id="folderTree" className="custom-scroll min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
           {folders.map((folder) => {
@@ -76,13 +77,13 @@ export default function Explorer({
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
         onDrop={onDrop}
-        className="flex max-h-[72vh] min-h-0 flex-col gap-6 rounded-[30px] border border-white/70 bg-white/55 p-6 shadow-glass backdrop-blur-xl"
+        className="flex max-h-[72vh] min-h-0 flex-col gap-4 overflow-hidden rounded-[30px] border border-white/70 bg-white/55 p-5 shadow-glass backdrop-blur-xl"
       >
-        <div id="dropzoneCard" className={`rounded-[28px] border-2 border-dashed p-5 transition ${dragActive ? "border-sky-400 bg-sky-50" : "border-slate-300 bg-white/75"}`}>
+        <div id="dropzoneCard" className={`rounded-[24px] border-2 border-dashed p-4 transition ${dragActive ? "border-sky-400 bg-sky-50" : "border-slate-300 bg-white/75"}`}>
           <div className="flex items-center justify-between gap-6">
             <div>
               <div className="text-xs font-semibold uppercase tracking-[0.26em] text-slate-500">Drag & Drop</div>
-              <div className="mt-2 text-xl font-semibold text-slate-950">{t("explorer.dropTitle")}</div>
+              <div className="mt-2 text-lg font-semibold text-slate-950">{t("explorer.dropTitle")}</div>
               <p className="mt-2 text-sm leading-6 text-slate-600">{t("explorer.dropBody")}</p>
             </div>
             <div className="rounded-2xl bg-slate-900 px-4 py-3 text-sm text-slate-100">{dragActive ? t("explorer.dropStateActive") : t("explorer.dropStateIdle")}</div>
@@ -93,7 +94,14 @@ export default function Explorer({
           <div className="mb-0 flex items-center justify-between px-5 pt-5"><div className="text-xs font-semibold uppercase tracking-[0.26em] text-sky-700">{t("explorer.files")}</div><div id="emptyState" className={`${rows.length ? "hidden" : "text-sm text-slate-500"}`}>{t("explorer.emptyFolder")}</div></div>
           <div className="min-h-0 flex-1 overflow-hidden rounded-[28px] p-4 pt-4">
             <div className="custom-scroll h-full overflow-auto rounded-3xl border border-slate-200">
-              <table className="min-w-full text-left text-sm">
+              <table className="min-w-full table-fixed text-left text-sm">
+                <colgroup>
+                  <col />
+                  <col className="w-[116px]" />
+                  <col className="w-[100px]" />
+                  <col className="w-[128px]" />
+                  <col className="w-[170px]" />
+                </colgroup>
                 <thead className="sticky top-0 z-10 rounded-3xl bg-slate-900/95 text-slate-100">
                   <tr>
                     <th className="px-4 py-3">{t("explorer.name")}</th>
@@ -106,6 +114,7 @@ export default function Explorer({
                 <tbody id="fileRows" className="bg-white">
                   {rows.map((entry) => {
                     const active = selectedEntry?.id === entry.id && selectedEntry?.kind === entry.kind;
+                    const downloadBusy = entry.kind === "File" && isDownloadBusy?.(entry);
                     return (
                       <tr
                         key={`${entry.kind}-${entry.id}`}
@@ -122,13 +131,13 @@ export default function Explorer({
                             </div>
                           </div>
                         </td>
-                        <td className="px-4 py-3 text-slate-600">{entry.kind === "Folder" ? "--" : fmtSize(entry.size, locale)}</td>
-                        <td className="px-4 py-3 text-slate-600">{entry.kind === "Folder" ? t("explorer.typeFolder") : entry.storage_mode || entry.mime_type}</td>
-                        <td className="px-4 py-3 text-slate-600">{fmtDate(entry.updated_at || entry.created_at, locale)}</td>
-                        <td className="px-4 py-3">
+                        <td className="px-4 py-3 text-slate-600 whitespace-nowrap">{entry.kind === "Folder" ? "--" : fmtSize(entry.size, locale)}</td>
+                        <td className="px-4 py-3 text-slate-600 whitespace-nowrap">{entry.kind === "Folder" ? t("explorer.typeFolder") : entry.storage_mode || entry.mime_type}</td>
+                        <td className="px-4 py-3 text-slate-600 whitespace-nowrap">{fmtDate(entry.updated_at || entry.created_at, locale)}</td>
+                        <td className="px-4 py-3 whitespace-nowrap">
                           {entry.kind === "File" ? (
                             <div className="flex gap-2">
-                              <button type="button" className="dl-btn table-btn" onClick={(event) => { event.stopPropagation(); onFileDownload(entry); }}>{t("explorer.download")}</button>
+                              <button type="button" disabled={downloadBusy} className={`dl-btn table-btn ${downloadBusy ? "cursor-not-allowed opacity-60" : ""}`} onClick={(event) => { event.stopPropagation(); onFileDownload(entry); }}>{t("explorer.download")}</button>
                               {String(entry.mime_type || "").startsWith("image/") ? <button type="button" className="table-btn" onClick={(event) => { event.stopPropagation(); onFilePreview(entry); }}>{t("explorer.preview")}</button> : null}
                             </div>
                           ) : (
@@ -145,7 +154,7 @@ export default function Explorer({
         </div>
       </section>
 
-      <aside className="flex max-h-[72vh] min-h-0 flex-col rounded-[28px] border border-white/70 bg-white/50 p-5 shadow-glass backdrop-blur-xl">
+      <aside className="flex max-h-[72vh] min-h-0 flex-col overflow-hidden rounded-[28px] border border-white/70 bg-white/50 p-5 shadow-glass backdrop-blur-xl">
         <div className="mb-4 text-xs font-semibold uppercase tracking-[0.26em] text-sky-700">{t("explorer.details")}</div>
         <div id="selectionDetails" className="custom-scroll min-h-0 flex-1 space-y-3 overflow-y-auto pr-1 text-sm text-slate-700">
           {details ? (
@@ -158,7 +167,7 @@ export default function Explorer({
               <div className="mt-4 flex flex-col gap-3">
                 {details.kind === "File" ? (
                   <>
-                    <button type="button" className="primary-btn w-full" onClick={() => onFileDownload(selectedEntry)}>{t("explorer.detailDownload")}</button>
+                    <button type="button" disabled={isDownloadBusy?.(selectedEntry)} className={`primary-btn w-full ${isDownloadBusy?.(selectedEntry) ? "cursor-not-allowed opacity-60" : ""}`} onClick={() => onFileDownload(selectedEntry)}>{t("explorer.detailDownload")}</button>
                     {String(details.mimeType || "").startsWith("image/") ? <button type="button" className="ghost-btn w-full" onClick={() => onFilePreview(selectedEntry)}>{t("explorer.detailPreview")}</button> : null}
                   </>
                 ) : (

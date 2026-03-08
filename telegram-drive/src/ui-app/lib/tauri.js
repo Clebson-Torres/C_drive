@@ -20,12 +20,52 @@ export async function call(cmd, args = {}) {
   return response.data;
 }
 
+function safeSerialize(data) {
+  try {
+    return JSON.stringify(data);
+  } catch {
+    return String(data);
+  }
+}
+
+export async function debugLog(channel, message, data) {
+  const suffix = data === undefined ? "" : ` | ${safeSerialize(data)}`;
+  const line = `${message}${suffix}`;
+  console.info(`[savedrive:${channel}] ${line}`);
+  try {
+    await call("frontend_debug_log", { channel, message: line });
+  } catch {
+    // best-effort only
+  }
+}
+
 export async function listenEvent(name, handler) {
   const { listen } = getTauri();
   if (!listen) {
     return () => {};
   }
   return listen(name, handler);
+}
+
+export async function listenFileDropEvent(handler) {
+  if (!window.__TAURI__ && !window.__TAURI_INTERNALS__) {
+    console.info("[savedrive:dragdrop] tauri APIs unavailable for native dragdrop listener");
+    return () => {};
+  }
+
+  try {
+    const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+    const current = getCurrentWebview?.();
+    if (current?.onDragDropEvent) {
+      console.info("[savedrive:dragdrop] native webview dragdrop listener attached");
+      return current.onDragDropEvent(handler);
+    }
+  } catch {
+    // fall through to legacy listener path
+  }
+
+  console.info("[savedrive:dragdrop] native webview dragdrop listener unavailable");
+  return () => {};
 }
 
 export function toAssetUrl(path) {

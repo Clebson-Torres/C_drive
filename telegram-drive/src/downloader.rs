@@ -10,9 +10,9 @@ use crate::progress::ProgressHub;
 use crate::telegram::TelegramClient;
 use futures::stream::{FuturesUnordered, StreamExt};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
@@ -27,6 +27,7 @@ pub struct DownloadService {
     telegram: TelegramClient,
     cache: LocalCdnCache,
     progress: ProgressHub,
+    active_downloads: Arc<Mutex<HashMap<i64, String>>>,
 }
 
 impl DownloadService {
@@ -43,6 +44,7 @@ impl DownloadService {
             telegram,
             cache,
             progress,
+            active_downloads: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -57,6 +59,69 @@ impl DownloadService {
     ) -> AppResult<DownloadResponse> {
         let file = self.db.get_file(file_id)?;
         let job_id = format!("download-{}", Uuid::new_v4());
+        if let Some(existing_job_id) = self.claim_download_slot(file_id, &job_id)? {
+            return Ok(DownloadResponse {
+                cache_state: CachePersistenceState::Pending,
+                cache_mode: requested_cache_mode,
+                message: Some(format!(
+                    "Download já está em andamento para {} ({})",
+                    file.name, existing_job_id
+                )),
+            });
+        }
+
+        let total = file.size.max(0) as u64;
+        let effective_cache_mode =
+            settings.resolve_download_cache_mode(total, requested_cache_mode);
+
+        self.progress.transition(
+            &job_id,
+            &file.name,
+            TransferState::Queued,
+            TransferPhase::Queued,
+            Some(file.storage_mode.clone()),
+            0,
+            total,
+            None,
+        );
+
+        let service = self.clone();
+        tokio::spawn(async move {
+            let result = service
+                .run_download_job(
+                    job_id.clone(),
+                    file_id,
+                    destination_path,
+                    max_parallelism,
+                    settings,
+                    requested_cache_mode,
+                    app_handle,
+                )
+                .await;
+            if let Err(error) = result {
+                error!(file_id, job_id = %job_id, error = %error, "download job failed");
+            }
+            service.unregister_active_download(file_id, &job_id);
+        });
+
+        Ok(DownloadResponse {
+            cache_state: CachePersistenceState::Pending,
+            cache_mode: effective_cache_mode,
+            message: Some("Download enfileirado.".to_string()),
+        })
+    }
+
+    async fn run_download_job(
+        &self,
+        job_id: String,
+        file_id: i64,
+        destination_path: PathBuf,
+        max_parallelism: usize,
+        settings: SettingsDto,
+        requested_cache_mode: DownloadCacheMode,
+        app_handle: Option<AppHandle>,
+    ) -> AppResult<DownloadResponse> {
+        let file = self.db.get_file(file_id)?;
         let total = file.size.max(0) as u64;
         let effective_cache_mode =
             settings.resolve_download_cache_mode(total, requested_cache_mode);
@@ -114,6 +179,31 @@ impl DownloadService {
         }
         .instrument(span)
         .await
+    }
+
+    fn claim_download_slot(&self, file_id: i64, job_id: &str) -> AppResult<Option<String>> {
+        let mut guard = self
+            .active_downloads
+            .lock()
+            .map_err(|_| AppError::Concurrency("active downloads mutex poisoned".to_string()))?;
+
+        if let Some(existing_job_id) = guard.get(&file_id).cloned() {
+            if self.progress.is_job_active(&existing_job_id) {
+                return Ok(Some(existing_job_id));
+            }
+            guard.remove(&file_id);
+        }
+
+        guard.insert(file_id, job_id.to_string());
+        Ok(None)
+    }
+
+    fn unregister_active_download(&self, file_id: i64, job_id: &str) {
+        if let Ok(mut guard) = self.active_downloads.lock() {
+            if guard.get(&file_id).map(String::as_str) == Some(job_id) {
+                guard.remove(&file_id);
+            }
+        }
     }
 
     async fn download_single_file(

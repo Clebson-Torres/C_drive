@@ -83,6 +83,23 @@ impl ProgressHub {
             .unwrap_or(false)
     }
 
+    pub fn is_job_active(&self, job_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|s| {
+                s.last_status
+                    .get(job_id)
+                    .map(|status| {
+                        matches!(
+                            status.state,
+                            TransferState::Queued | TransferState::Running | TransferState::Paused
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     pub fn cancel(&self, job_id: &str) {
         if let Ok(mut s) = self.state.lock() {
             s.cancelled.insert(job_id.to_string());

@@ -423,6 +423,15 @@ async fn settings_set(
     ))
 }
 
+#[tauri::command]
+async fn frontend_debug_log(
+    channel: String,
+    message: String,
+) -> Result<ApiResponse<()>, String> {
+    info!(target: "savedrive_frontend", channel = %channel, message = %message);
+    Ok(ApiResponse::ok(()))
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 fn map_response<T>(res: Result<T, models::AppError>) -> ApiResponse<T> {
@@ -576,6 +585,7 @@ async fn main() {
             transfers_snapshot,
             settings_get,
             settings_set,
+            frontend_debug_log,
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

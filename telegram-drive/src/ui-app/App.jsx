@@ -7,7 +7,7 @@ import SettingsModal from "./components/SettingsModal";
 import DownloadModal from "./components/DownloadModal";
 import NewFolderModal from "./components/NewFolderModal";
 import PreviewModal from "./components/PreviewModal";
-import { call, listenEvent, toAssetUrl } from "./lib/tauri";
+import { call, debugLog, listenEvent, listenFileDropEvent, toAssetUrl } from "./lib/tauri";
 import { defaultDownloadCacheModeForSize, errText } from "./lib/format";
 import { createI18n, detectLocale } from "./lib/i18n";
 
@@ -91,8 +91,10 @@ export default function App() {
   const [previewPath, setPreviewPath] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [profileAvatarBroken, setProfileAvatarBroken] = useState(false);
+  const [pendingDownloadIds, setPendingDownloadIds] = useState(new Set());
   const dropSignatureRef = useRef("");
   const dropSignatureUntilRef = useRef(0);
 
@@ -101,12 +103,6 @@ export default function App() {
     [transfers]
   );
 
-  const currentFolderName = useMemo(() => {
-    const folder = folders.find((item) => item.id === currentFolderId);
-    return folder?.name || t("header.savedMessages");
-  }, [folders, currentFolderId, t]);
-
-  const entryCount = listing.files.length + listing.folders.length;
   const selectionDetails = detailsFromEntry(selectedEntry);
   const profileAvatarUrl = useMemo(() => (profileAvatarBroken ? null : toAssetUrl(profile?.avatar_path_opt)), [profile?.avatar_path_opt, profileAvatarBroken]);
   const previewUrl = useMemo(() => toAssetUrl(previewPath), [previewPath]);
@@ -245,10 +241,13 @@ export default function App() {
   const triggerUpload = useCallback(async (paths) => {
     if (!paths?.length) return;
     try {
+      await debugLog("dragdrop", "trigger_upload", { currentFolderId, count: paths.length, sample: paths.slice(0, 3) });
       await call("upload_files", { folderId: currentFolderId, folder_id: currentFolderId, paths });
+      await debugLog("dragdrop", "trigger_upload_ok", { count: paths.length });
       setDriveMessage(t("misc.uploadStarted", { count: paths.length }), "ok");
       await refreshTransfers();
     } catch (error) {
+      await debugLog("dragdrop", "trigger_upload_error", { error: errText(error) });
       setDriveMessage(errText(error));
     }
   }, [currentFolderId, refreshTransfers, setDriveMessage, t]);
@@ -256,15 +255,21 @@ export default function App() {
   const handleDroppedPaths = useCallback(async (paths) => {
     setDragActive(false);
     const normalized = (paths || []).filter(Boolean);
-    if (!normalized.length) return;
-    const signature = normalized.slice().sort().join("|");
-    if (dropSignatureRef.current === signature && Date.now() < dropSignatureUntilRef.current) {
+    if (!normalized.length) {
+      debugLog("dragdrop", "handle_dropped_paths_empty");
+      setDriveMessage(t("misc.dragDropNoPath"));
       return;
     }
+    const signature = normalized.slice().sort().join("|");
+    if (dropSignatureRef.current === signature && Date.now() < dropSignatureUntilRef.current) {
+      debugLog("dragdrop", "handle_dropped_paths_deduped", { signature, count: normalized.length });
+      return;
+    }
+    debugLog("dragdrop", "handle_dropped_paths", { signature, count: normalized.length, sample: normalized.slice(0, 3) });
     dropSignatureRef.current = signature;
     dropSignatureUntilRef.current = Date.now() + 1500;
     await triggerUpload(normalized);
-  }, [triggerUpload]);
+  }, [setDriveMessage, t, triggerUpload]);
 
   const handleDomDragEnter = useCallback((event) => {
     event.preventDefault();
@@ -289,6 +294,12 @@ export default function App() {
   const handleDomDrop = useCallback(async (event) => {
     event.preventDefault();
     const paths = extractDomDroppedPaths(event.dataTransfer);
+    await debugLog("dragdrop", "dom_drop", {
+      fileCount: event.dataTransfer?.files?.length || 0,
+      itemCount: event.dataTransfer?.items?.length || 0,
+      extractedCount: paths.length,
+      sample: paths.slice(0, 3),
+    });
     if (!paths.length) {
       setDragActive(false);
       setDriveMessage(t("misc.dragDropNoPath"));
@@ -307,14 +318,58 @@ export default function App() {
         auth_state_changed: ({ payload }) => mounted && setAuthState(payload),
         index_changed: async () => mounted && refreshListing(currentFolderId, search),
         download_cache_state_changed: ({ payload }) => mounted && payload?.message && setDriveMessage(payload.message, payload.state === "failed" ? "error" : "ok"),
-        "tauri://drag-enter": () => mounted && setDragActive(true),
-        "tauri://drag-over": () => mounted && setDragActive(true),
-        "tauri://drag-leave": () => mounted && setDragActive(false),
-        "tauri://drag-drop": ({ payload }) => mounted && handleDroppedPaths(extractDroppedPaths(payload)),
+        "tauri://drag-enter": () => {
+          if (!mounted) return;
+          debugLog("dragdrop", "legacy_drag_enter");
+          setDragActive(true);
+        },
+        "tauri://drag-over": () => {
+          if (!mounted) return;
+          debugLog("dragdrop", "legacy_drag_over");
+          setDragActive(true);
+        },
+        "tauri://drag-leave": () => {
+          if (!mounted) return;
+          debugLog("dragdrop", "legacy_drag_leave");
+          setDragActive(false);
+        },
+        "tauri://drag-drop": ({ payload }) => {
+          if (!mounted) return;
+          const paths = extractDroppedPaths(payload);
+          debugLog("dragdrop", "legacy_drag_drop", { extractedCount: paths.length, sample: paths.slice(0, 3), payload });
+          handleDroppedPaths(paths);
+        },
       };
       for (const [name, handler] of Object.entries(handlers)) {
         unsubs.push(await listenEvent(name, handler));
       }
+      const nativeUnlisten = await listenFileDropEvent((event) => {
+        if (!mounted) return;
+        const payload = event?.payload || {};
+        const paths = extractDroppedPaths(payload.paths || payload);
+        debugLog("dragdrop", "tauri_dragdrop_event", {
+          type: payload.type,
+          extractedCount: paths.length,
+          sample: paths.slice(0, 3),
+          payload,
+        });
+        switch (payload.type) {
+          case "enter":
+          case "over":
+            setDragActive(true);
+            break;
+          case "leave":
+            setDragActive(false);
+            break;
+          case "drop":
+            handleDroppedPaths(paths);
+            break;
+          default:
+            break;
+        }
+      });
+      await debugLog("dragdrop", "native_dragdrop_listener_registered", { registered: typeof nativeUnlisten === "function" });
+      unsubs.push(nativeUnlisten);
     })();
 
     const injectTransfer = (event) => {
@@ -337,6 +392,32 @@ export default function App() {
     }, 1200);
     return () => clearInterval(interval);
   }, [activeTransfers, refreshTransfers]);
+
+  useEffect(() => {
+    const preventDefault = (event) => {
+      event.preventDefault();
+    };
+    window.addEventListener("dragenter", preventDefault);
+    window.addEventListener("dragover", preventDefault);
+    window.addEventListener("dragleave", preventDefault);
+    window.addEventListener("drop", preventDefault);
+    return () => {
+      window.removeEventListener("dragenter", preventDefault);
+      window.removeEventListener("dragover", preventDefault);
+      window.removeEventListener("dragleave", preventDefault);
+      window.removeEventListener("drop", preventDefault);
+    };
+  }, []);
+
+  const hasActiveDownloadForFile = useCallback((file) => {
+    if (!file) return false;
+    if (pendingDownloadIds.has(file.id)) return true;
+    return [...transfers.values()].some((transfer) =>
+      String(transfer.job_id || "").startsWith("download-")
+      && ["Queued", "Running", "Paused"].includes(transfer.state)
+      && transfer.file_name === file.name
+    );
+  }, [pendingDownloadIds, transfers]);
 
   const handleStartAuth = async () => {
     try {
@@ -438,7 +519,9 @@ export default function App() {
   };
 
   const handleDownloadConfirm = async () => {
-    if (!downloadFile) return;
+    if (!downloadFile || hasActiveDownloadForFile(downloadFile)) return;
+    setPendingDownloadIds((current) => new Set(current).add(downloadFile.id));
+    setQueueOpen(true);
     try {
       const destinationPath = await call("pick_save_file_native", {
         suggestedName: downloadFile.name,
@@ -458,6 +541,12 @@ export default function App() {
       await refreshTransfers();
     } catch (error) {
       setDriveMessage(errText(error));
+    } finally {
+      setPendingDownloadIds((current) => {
+        const next = new Set(current);
+        if (downloadFile?.id) next.delete(downloadFile.id);
+        return next;
+      });
     }
   };
 
@@ -513,13 +602,11 @@ export default function App() {
             onNewFolder={() => setNewFolderOpen(true)}
             profile={profile}
             profileAvatarUrl={profileAvatarUrl}
-            currentFolderName={currentFolderName}
-            entryCount={entryCount}
             activeTransfers={activeTransfers}
+            queueOpen={queueOpen}
+            onToggleQueue={() => setQueueOpen((value) => !value)}
             userMenuOpen={userMenuOpen}
             onToggleUserMenu={() => setUserMenuOpen((value) => !value)}
-            onOpenSettings={() => { setSettingsOpen(true); setUserMenuOpen(false); }}
-            onLogout={handleLogout}
           />
 
           {driveMessage ? <div id="driveMessage" className={`rounded-2xl border px-4 py-3 text-sm ${driveMessage.kind === "ok" ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-rose-200 bg-rose-50 text-rose-700"}`}>{driveMessage.text}</div> : <div id="driveMessage" className="hidden" />}
@@ -539,14 +626,24 @@ export default function App() {
             onDragOver={handleDomDragOver}
             onDragLeave={handleDomDragLeave}
             onDrop={handleDomDrop}
-            onFileDownload={(file) => setDownloadFile(file)}
+            isDownloadBusy={hasActiveDownloadForFile}
+            onFileDownload={(file) => {
+              if (hasActiveDownloadForFile(file)) {
+                setQueueOpen(true);
+                setDriveMessage(t("misc.downloadAlreadyQueued"), "ok");
+                return;
+              }
+              setDownloadFile(file);
+            }}
             onFilePreview={handlePreview}
           />
 
           <TransferQueue
             t={t}
             locale={locale}
+            open={queueOpen}
             transfers={[...transfers.values()]}
+            onClose={() => setQueueOpen(false)}
             onPause={(jobId) => updateTransferAction("transfer_pause", jobId)}
             onResume={(jobId) => updateTransferAction("transfer_resume", jobId)}
             onCancel={(jobId) => updateTransferAction("transfer_cancel", jobId)}
@@ -593,7 +690,7 @@ export default function App() {
       )}
 
       <NewFolderModal t={t} open={newFolderOpen} value={newFolderName} onChange={setNewFolderName} onConfirm={handleCreateFolder} onCancel={() => setNewFolderOpen(false)} />
-      <DownloadModal t={t} locale={locale} open={Boolean(downloadFile)} file={downloadFile} settings={settings} cacheMode={downloadCacheMode} summary={downloadSummary} onChangeMode={setDownloadCacheMode} onConfirm={handleDownloadConfirm} onCancel={() => setDownloadFile(null)} />
+      <DownloadModal t={t} locale={locale} open={Boolean(downloadFile)} file={downloadFile} settings={settings} cacheMode={downloadCacheMode} summary={downloadSummary} submitting={downloadFile ? pendingDownloadIds.has(downloadFile.id) : false} onChangeMode={setDownloadCacheMode} onConfirm={handleDownloadConfirm} onCancel={() => setDownloadFile(null)} />
       <SettingsModal t={t} locale={locale} open={settingsOpen} settings={settings} onChunkSizeChange={(value) => setSettings((current) => ({ ...current, chunk_size_bytes: value }))} onParallelismChange={(value) => setSettings((current) => ({ ...current, max_parallelism: value }))} onEncryptChange={(value) => setSettings((current) => ({ ...current, encrypt_chunks: value }))} onSave={handleSaveSettings} onClose={() => setSettingsOpen(false)} />
       <PreviewModal t={t} open={Boolean(previewUrl)} path={previewUrl} onClose={() => setPreviewPath(null)} />
     </div>
