@@ -1,13 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Savedrive",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.telegram.drive",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeDevCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/dev-server.ps1",
-    "beforeBuildCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File ../scripts/build-front.ps1"
+    "beforeDevCommand": "node ../scripts/run-npm-command.mjs run dev",
+    "beforeBuildCommand": "node ../scripts/run-npm-command.mjs run build"
   },
   "app": {
     "windows": [

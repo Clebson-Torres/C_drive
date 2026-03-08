@@ -71,17 +71,8 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: npm run sync:version -- ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
-      - name: Prepare draft release with generated notes
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-          name: Savedrive ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-          draft: true
-          prerelease: false
-          generate_release_notes: true
-
       - name: Build and publish Tauri bundle
-        uses: tauri-apps/tauri-action@v0.6.1
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -90,4 +81,5 @@ jobs:
           releaseName: Savedrive ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           releaseDraft: true
           prerelease: false
+          releaseBody: "See the assets to download this version."
           args: --ci --no-sign
