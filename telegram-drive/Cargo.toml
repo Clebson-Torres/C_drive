@@ -20,6 +20,7 @@ grammers-client = "0.9"
 grammers-mtsender = "0.9"
 grammers-session = { version = "0.9", default-features = false, features = ["serde"] }
 hex = "0.4"
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 mime_guess = "2"
 moka = { version = "0.12", features = ["future"] }
 pbkdf2 = "0.12"

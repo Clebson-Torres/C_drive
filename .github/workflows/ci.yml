@@ -44,6 +44,10 @@ jobs:
         working-directory: telegram-drive
         run: npm ci
 
+      - name: Security UI check
+        working-directory: telegram-drive
+        run: npm run check:security-ui
+
       - name: Install Playwright browser
         working-directory: telegram-drive
         run: npx playwright install --with-deps chromium
@@ -97,6 +101,10 @@ jobs:
       - name: Install NPM dependencies
         working-directory: telegram-drive
         run: npm ci
+
+      - name: Security UI check
+        working-directory: telegram-drive
+        run: npm run check:security-ui
 
       - name: Cargo check
         working-directory: telegram-drive

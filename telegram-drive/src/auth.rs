@@ -2,7 +2,7 @@ use crate::database::{Database, NewFileRecord};
 use crate::models::{
     AppError, AppResult, AuthPrefillDto, AuthState, FileOrigin, StorageMode, UserProfileDto,
 };
-use crate::security::derive_local_key;
+use crate::security::{derive_legacy_local_key, derive_local_key};
 use crate::telegram::TelegramClient;
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
@@ -23,9 +23,13 @@ impl AuthService {
     #[tracing::instrument(skip(self), name = "session_restore")]
     pub async fn restore_session(&self) -> AppResult<AuthState> {
         if let Some(blob) = self.db.load_session_blob("primary")? {
-            let plain = decrypt_blob(self.session_salt_path(), &blob)?;
+            let decrypted = decrypt_blob(self.session_salt_path(), &blob)?;
+            let plain = decrypted.plain;
             let _ = self.telegram.restore_session_blob(&plain)?;
             let state = self.telegram.restore_runtime_auth().await?;
+            if decrypted.migrated {
+                self.persist_session().await?;
+            }
             return Ok(state);
         }
         Ok(AuthState::LoggedOut)
@@ -121,24 +125,44 @@ fn encrypt_blob(
     Ok(out)
 }
 
+struct DecryptedBlob {
+    plain: Vec<u8>,
+    migrated: bool,
+}
+
 fn decrypt_blob(
     salt_path: impl AsRef<std::path::Path>,
     cipher_text: &[u8],
-) -> AppResult<Vec<u8>> {
+) -> AppResult<DecryptedBlob> {
     if cipher_text.len() < 12 {
         return Err(AppError::Crypto("session blob too short".to_string()));
     }
     let (nonce, payload) = cipher_text.split_at(12);
     let key = derive_local_key(salt_path.as_ref(), "auth-session-blob")?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| AppError::Crypto(e.to_string()))?;
-    cipher
+    if let Ok(plain) = cipher.decrypt(Nonce::from_slice(nonce), payload) {
+        return Ok(DecryptedBlob {
+            plain,
+            migrated: false,
+        });
+    }
+
+    let legacy_key = derive_legacy_local_key(salt_path.as_ref(), "auth-session-blob")?;
+    let legacy_cipher =
+        Aes256Gcm::new_from_slice(&legacy_key).map_err(|e| AppError::Crypto(e.to_string()))?;
+    let plain = legacy_cipher
         .decrypt(Nonce::from_slice(nonce), payload)
-        .map_err(|e| AppError::Crypto(e.to_string()))
+        .map_err(|e| AppError::Crypto(e.to_string()))?;
+    Ok(DecryptedBlob {
+        plain,
+        migrated: true,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::derive_legacy_local_key;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -197,5 +221,48 @@ mod tests {
 
         let prefill_after = auth2.prefill().unwrap().unwrap();
         assert_eq!(prefill_after.phone, "+5511999999999");
+    }
+
+    #[tokio::test]
+    async fn restore_migrates_legacy_encrypted_session_blob() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        let tg = TelegramClient::new_with_mode(temp.path().join("tg"), true)
+            .await
+            .unwrap();
+        let auth = AuthService::new(db.clone(), tg);
+
+        let legacy_plain = serde_json::json!({
+            "state": AuthState::LoggedIn,
+            "phone": "+5511888888888"
+        });
+        let legacy_bytes = serde_json::to_vec(&legacy_plain).unwrap();
+        let legacy_blob = encrypt_blob_with_legacy_key(auth.session_salt_path(), &legacy_bytes).unwrap();
+        db.save_session_blob("primary", &legacy_blob).unwrap();
+
+        let restored = auth.restore_session().await.unwrap();
+        assert!(matches!(restored, AuthState::LoggedIn));
+
+        let migrated_blob = db.load_session_blob("primary").unwrap().unwrap();
+        assert_ne!(legacy_blob, migrated_blob);
+        let decrypted = decrypt_blob(auth.session_salt_path(), &migrated_blob).unwrap();
+        assert!(!decrypted.migrated);
+    }
+
+    fn encrypt_blob_with_legacy_key(
+        salt_path: impl AsRef<std::path::Path>,
+        plain: &[u8],
+    ) -> AppResult<Vec<u8>> {
+        let key = derive_legacy_local_key(salt_path.as_ref(), "auth-session-blob")?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&key).map_err(|e| AppError::Crypto(e.to_string()))?;
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let mut out = nonce.to_vec();
+        let mut encrypted = cipher
+            .encrypt(&nonce, plain)
+            .map_err(|e| AppError::Crypto(e.to_string()))?;
+        out.append(&mut encrypted);
+        Ok(out)
     }
 }

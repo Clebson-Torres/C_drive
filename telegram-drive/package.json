@@ -11,6 +11,7 @@
     "tauri": "tauri",
     "build:desktop": "tauri build --ci --no-sign",
     "build:desktop:ci": "tauri build --debug --no-bundle --ci --no-sign",
+    "check:security-ui": "node ./scripts/check-no-innerhtml.mjs",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed"
   },

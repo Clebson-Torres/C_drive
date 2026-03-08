@@ -84,7 +84,10 @@ impl UploadClientPool {
 
         for i in 0..n {
             // Cada cliente lê a mesma sessão em disco — já tem auth_key
-            let session = Arc::new(PersistentSession::open_or_create(session_path));
+            let session = Arc::new(
+                PersistentSession::open_or_create(session_path)
+                    .map_err(|e| AppError::Crypto(format!("session init failed: {e}")))?,
+            );
             let sender_pool = SenderPool::new(session, default_telegram_api_id());
             let client = Client::new(sender_pool.handle.clone());
             let task = tokio::spawn(async move {
@@ -680,7 +683,10 @@ impl TelegramClient {
             return Ok(client);
         }
 
-        let session = Arc::new(PersistentSession::open_or_create(&self.session_path));
+        let session = Arc::new(
+            PersistentSession::open_or_create(&self.session_path)
+                .map_err(|e| AppError::Crypto(format!("session init failed: {e}")))?,
+        );
         let sender_pool = SenderPool::new(session, default_telegram_api_id());
         let client = Client::new(sender_pool.handle.clone());
         let runner_task = tokio::spawn(async move {

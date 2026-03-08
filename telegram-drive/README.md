@@ -1,33 +1,29 @@
-﻿# Savedrive
+# Savedrive
 
-Desktop app em Rust + Tauri para gerenciamento de arquivos com backend Telegram, com cache local, deduplicacao, upload/download paralelo e UI de file manager.
+Desktop app em Rust + Tauri para gerenciamento de arquivos com backend Telegram, cache local, deduplicacao e UI React/Tailwind.
+
+## Superficie ativa
+
+- Frontend oficial: `src/ui-app/` com `Vite + React + Tailwind`
+- Backend desktop: `src/`
+- Configuracao Tauri: `tauri.conf.json` e `src-tauri/tauri.conf.json`
+
+O diretório legado `ui/` foi removido e nao faz mais parte do produto.
 
 ## Status atual
 
 - Login Telegram por telefone + codigo + 2FA
-- Persistencia de sessao local criptografada (sem relogin apos reinicio)
-- Fluxo QR removido do produto
-- Tela de login dedicada (multietapas)
-- Upload hibrido:
-  - ate `1 GiB`: objeto unico original no Telegram
-  - acima de `1 GiB`: chunking de `8 MiB` com criptografia + dedup por chunk
-- Testes unitarios + integracao + E2E mockado
-
-## Arquitetura
-
-- **UI (`ui/`)**: login, navegacao de arquivos, busca, progresso e preview.
-- **Core (`src/`)**:
-  - `auth.rs`: orquestra login, restauracao e persistencia de sessao de auth.
-  - `telegram.rs`: cliente Telegram, autenticacao e transporte de objetos/chunks.
-  - `session_store.rs`: `PersistentSession` (`grammers_session::Session`) com arquivo criptografado + debounce + escrita atomica.
-  - `database.rs`, `dedup.rs`, `chunking.rs`, `cache.rs`, `uploader.rs`, `downloader.rs`, `file_index.rs`, `progress.rs`.
+- Sessao persistente criptografada com segredo protegido pelo SO
+- Upload/download paralelo com fila e cache local
+- Importacao dos arquivos ja existentes em `Saved Messages`
+- Frontend React/Tailwind com CSP explicita
+- `api_hash` nao e persistido no banco local
 
 ## Build e execucao
 
 ```bash
-cargo check
-cargo test
-cargo run
+npm install
+npm run tauri dev
 ```
 
 ## Testes
@@ -37,48 +33,27 @@ cargo run
 cargo test
 ```
 
-### Matriz real de transferencias
-Executa upload/download com arquivos fisicos reais em backend mockado do Telegram, gerando logs ricos de throughput e modo de armazenamento:
-
+### Frontend e seguranca
 ```bash
-cargo test upload_download_matrix_real_files -- --ignored --nocapture
-```
-
-Artefatos:
-- `logs/manual/transfer-matrix-run.log`
-- `logs/perf/transfer-matrix.jsonl`
-- `logs/perf/transfer-matrix-summary.md`
-
-### E2E (Playwright, mock CI)
-```bash
-npm install
+npm run check:security-ui
 npm run test:e2e
 ```
 
-Arquivos E2E:
-- `e2e/auth_flow.spec.ts`
-- `e2e/click_regression.spec.ts`
-- `playwright.config.ts`
-
-### Smoke desktop (manual)
-- roteiro: `scripts/desktop-smoke-tauri-driver.md`
+### Build
+```bash
+npm run build
+npm run build:desktop:ci
+```
 
 ## Seguranca
 
-- Nao hardcode de credenciais no codigo.
-- Login recebe `phone`, `api_id`, `api_hash` pela tela.
-- Dados sensiveis de sessao persistidos localmente em formato criptografado.
+- Sessao local protegida por segredo do SO (Windows Credential Manager / macOS Keychain / Linux Secret Service)
+- Blobs legados sao migrados automaticamente no primeiro restore bem-sucedido
+- CSP explicita em producao e CSP de dev restrita ao necessario para Vite/HMR
+- `auth.prefill` persiste apenas telefone
+- Gate estatico impede `innerHTML` no frontend ativo
 
 ## Observabilidade
 
-Spans de tracing para:
-- `auth_start`
-- `auth_verify_code`
-- `auth_verify_password`
-- `session_restore`
-- `upload_file`
-- `download_file`
-
-Runtime log:
-- `logs/telegram/runtime.log`
-
+- runtime log: `logs/telegram/runtime.log`
+- logs de drag/drop e shell frontend usam target `savedrive_frontend`

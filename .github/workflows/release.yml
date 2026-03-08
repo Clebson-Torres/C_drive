@@ -61,6 +61,10 @@ jobs:
         working-directory: telegram-drive
         run: npm ci
 
+      - name: Security UI check
+        working-directory: telegram-drive
+        run: npm run check:security-ui
+
       - name: Sync application version from tag
         working-directory: telegram-drive
         env:

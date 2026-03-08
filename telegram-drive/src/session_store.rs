@@ -2,7 +2,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     AeadCore, Aes256Gcm, Nonce,
 };
-use crate::security::derive_local_key;
+use crate::security::{derive_legacy_local_key, derive_local_key};
 use futures_core::future::BoxFuture;
 use grammers_session::types::{DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
 use grammers_session::{Session, SessionData};
@@ -39,16 +39,16 @@ pub struct PersistentSession {
     path: PathBuf,
     #[allow(dead_code)]
     key: [u8; 32],
-    cache: Arc<RwLock<PersistedState>>,
+    cache: Arc<RwLock<LoadedState>>,
     save_tx: mpsc::UnboundedSender<()>,
 }
 
 impl PersistentSession {
-    pub fn open_or_create(path: impl AsRef<Path>) -> Self {
+    pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
         let key = derive_local_key(&salt_path_for(&path), "telegram-session-store")
-            .unwrap_or_else(|_| [0u8; 32]);
-        let loaded = load_state_or_default(&path, &key);
+            .map_err(|e| e.to_string())?;
+        let loaded = load_state_or_default(&path, &key, &salt_path_for(&path));
         let cache = Arc::new(RwLock::new(loaded));
         let (save_tx, mut save_rx) = mpsc::unbounded_channel::<()>();
 
@@ -61,18 +61,24 @@ impl PersistentSession {
                 while save_rx.try_recv().is_ok() {}
 
                 let snapshot = cache_clone.read().await.clone();
-                if let Err(e) = save_snapshot(&path_clone, &key_clone, &snapshot).await {
+                if let Err(e) = save_snapshot(&path_clone, &key_clone, &snapshot.state).await {
                     error!(error = %e, "failed to persist telegram session snapshot");
                 }
             }
         });
 
-        Self {
+        let session = Self {
             path,
             key,
             cache,
             save_tx,
+        };
+
+        if session.cache.try_read().map(|state| state.needs_rewrite).unwrap_or(false) {
+            session.schedule_save();
         }
+
+        Ok(session)
     }
 
     fn schedule_save(&self) {
@@ -82,16 +88,22 @@ impl PersistentSession {
     #[cfg(test)]
     pub async fn flush_now(&self) {
         let snapshot = self.cache.read().await.clone();
-        if let Err(e) = save_snapshot(&self.path, &self.key, &snapshot).await {
+        if let Err(e) = save_snapshot(&self.path, &self.key, &snapshot.state).await {
             error!(error = %e, "failed to flush telegram session snapshot");
         }
     }
 }
 
+#[derive(Clone)]
+struct LoadedState {
+    state: PersistedState,
+    needs_rewrite: bool,
+}
+
 impl Session for PersistentSession {
     fn home_dc_id(&self) -> i32 {
         if let Ok(guard) = self.cache.try_read() {
-            guard.home_dc
+            guard.state.home_dc
         } else {
             SessionData::default().home_dc
         }
@@ -99,14 +111,14 @@ impl Session for PersistentSession {
 
     fn set_home_dc_id(&self, dc_id: i32) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            self.cache.write().await.home_dc = dc_id;
+            self.cache.write().await.state.home_dc = dc_id;
             self.schedule_save();
         })
     }
 
     fn dc_option(&self, dc_id: i32) -> Option<DcOption> {
         if let Ok(guard) = self.cache.try_read() {
-            guard.dc_options.get(&dc_id).cloned()
+            guard.state.dc_options.get(&dc_id).cloned()
         } else {
             None
         }
@@ -118,6 +130,7 @@ impl Session for PersistentSession {
             self.cache
                 .write()
                 .await
+                .state
                 .dc_options
                 .insert(dc_option.id, dc_option);
             self.schedule_save();
@@ -125,37 +138,38 @@ impl Session for PersistentSession {
     }
 
     fn peer(&self, peer: PeerId) -> BoxFuture<'_, Option<PeerInfo>> {
-        Box::pin(async move { self.cache.read().await.peer_infos.get(&peer).cloned() })
+        Box::pin(async move { self.cache.read().await.state.peer_infos.get(&peer).cloned() })
     }
 
     fn cache_peer(&self, peer: &PeerInfo) -> BoxFuture<'_, ()> {
         let peer = peer.clone();
         Box::pin(async move {
-            self.cache.write().await.peer_infos.insert(peer.id(), peer);
+            self.cache.write().await.state.peer_infos.insert(peer.id(), peer);
             self.schedule_save();
         })
     }
 
     fn updates_state(&self) -> BoxFuture<'_, UpdatesState> {
-        Box::pin(async move { self.cache.read().await.updates_state.clone() })
+        Box::pin(async move { self.cache.read().await.state.updates_state.clone() })
     }
 
     fn set_update_state(&self, update: UpdateState) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             let mut guard = self.cache.write().await;
             match update {
-                UpdateState::All(state) => guard.updates_state = state,
+                UpdateState::All(state) => guard.state.updates_state = state,
                 UpdateState::Primary { pts, date, seq } => {
-                    guard.updates_state.pts = pts;
-                    guard.updates_state.date = date;
-                    guard.updates_state.seq = seq;
+                    guard.state.updates_state.pts = pts;
+                    guard.state.updates_state.date = date;
+                    guard.state.updates_state.seq = seq;
                 }
                 UpdateState::Secondary { qts } => {
-                    guard.updates_state.qts = qts;
+                    guard.state.updates_state.qts = qts;
                 }
                 UpdateState::Channel { id, pts } => {
-                    guard.updates_state.channels.retain(|c| c.id != id);
+                    guard.state.updates_state.channels.retain(|c| c.id != id);
                     guard
+                        .state
                         .updates_state
                         .channels
                         .push(grammers_session::types::ChannelState { id, pts });
@@ -170,15 +184,33 @@ fn salt_path_for(path: &Path) -> PathBuf {
     path.with_extension("salt")
 }
 
-fn load_state_or_default(path: &Path, key: &[u8; 32]) -> PersistedState {
+fn load_state_or_default(path: &Path, key: &[u8; 32], salt_path: &Path) -> LoadedState {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(_) => return PersistedState::default(),
+        Err(_) => {
+            return LoadedState {
+                state: PersistedState::default(),
+                needs_rewrite: false,
+            }
+        }
     };
 
-    match decrypt_blob(key, &bytes).and_then(|plain| {
-        serde_json::from_slice::<PersistedState>(&plain).map_err(|e| e.to_string())
-    }) {
+    match decrypt_blob(key, &bytes)
+        .map(|plain| (plain, false))
+        .or_else(|_| {
+            let legacy_key = derive_legacy_local_key(salt_path, "telegram-session-store")
+                .map_err(|e| e.to_string())?;
+            decrypt_blob(&legacy_key, &bytes).map(|plain| (plain, true))
+        })
+        .and_then(|(plain, migrated)| {
+            serde_json::from_slice::<PersistedState>(&plain)
+                .map_err(|e| e.to_string())
+                .map(|state| LoadedState {
+                    state,
+                    needs_rewrite: migrated,
+                })
+        })
+    {
         Ok(state) => state,
         Err(e) => {
             warn!(error = %e, path = %path.display(), "corrupted telegram session snapshot; backing up and resetting");
@@ -187,7 +219,10 @@ fn load_state_or_default(path: &Path, key: &[u8; 32]) -> PersistedState {
                 let backup = parent.join(format!("telegram_session.corrupt-{ts}.bin"));
                 let _ = std::fs::rename(path, backup);
             }
-            PersistedState::default()
+            LoadedState {
+                state: PersistedState::default(),
+                needs_rewrite: false,
+            }
         }
     }
 }
@@ -238,6 +273,7 @@ fn decrypt_blob(key: &[u8; 32], cipher_text: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::derive_legacy_local_key;
 
     #[tokio::test]
     async fn snapshot_roundtrip_and_reload() {
@@ -245,11 +281,12 @@ mod tests {
         let path = temp.path().join("telegram_session.bin");
 
         let session = PersistentSession::open_or_create(&path);
+        let session = session.unwrap();
         session.set_home_dc_id(4).await;
         session.flush_now().await;
 
         let reloaded = PersistentSession::open_or_create(&path);
-        assert_eq!(reloaded.home_dc_id(), 4);
+        assert_eq!(reloaded.unwrap().home_dc_id(), 4);
     }
 
     #[tokio::test]
@@ -274,5 +311,31 @@ mod tests {
             }
         }
         assert!(found_backup);
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_is_rewritten_with_platform_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("telegram_session.bin");
+        let salt_path = salt_path_for(&path);
+
+        let legacy_state = PersistedState {
+            home_dc: 9,
+            ..PersistedState::default()
+        };
+        let legacy_key = derive_legacy_local_key(&salt_path, "telegram-session-store").unwrap();
+        let legacy_bytes = encrypt_blob(&legacy_key, &serde_json::to_vec(&legacy_state).unwrap()).unwrap();
+        tokio::fs::write(&path, legacy_bytes.clone()).await.unwrap();
+
+        let session = PersistentSession::open_or_create(&path).unwrap();
+        assert_eq!(session.home_dc_id(), 9);
+        session.flush_now().await;
+
+        let rewritten = tokio::fs::read(&path).await.unwrap();
+        assert_ne!(rewritten, legacy_bytes);
+        let current_key = derive_local_key(&salt_path, "telegram-session-store").unwrap();
+        let plain = decrypt_blob(&current_key, &rewritten).unwrap();
+        let state: PersistedState = serde_json::from_slice(&plain).unwrap();
+        assert_eq!(state.home_dc, 9);
     }
 }
